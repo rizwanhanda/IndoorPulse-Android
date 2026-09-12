@@ -6,4 +6,5 @@ interface SensorDataSource {
     val stepEvents: Flow<StepEvent>
     val orientationEvents: Flow<OrientationEvent>
     val gpsLocations: Flow<GpsLocation>
+    val gravityEvents: Flow<GravityEvent>
 }

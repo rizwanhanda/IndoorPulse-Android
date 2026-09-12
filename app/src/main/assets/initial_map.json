@@ -1,0 +1,35 @@
+{
+  "floors": [
+    {
+      "floorId": "floor_1",
+      "level": 1,
+      "name": "Ground Floor",
+      "altitudeOffsetMeters": 0.0
+    }
+  ],
+  "nodes": [
+    {
+      "nodeId": "entrance",
+      "floorId": "floor_1",
+      "x": 0.0,
+      "y": 0.0,
+      "nodeType": "entrance"
+    },
+    {
+      "nodeId": "hallway_1",
+      "floorId": "floor_1",
+      "x": 0.0,
+      "y": 10.0,
+      "nodeType": "corridor"
+    }
+  ],
+  "edges": [
+    {
+      "edgeId": "edge_1",
+      "fromNodeId": "entrance",
+      "toNodeId": "hallway_1",
+      "lengthMeters": 10.0,
+      "edgeType": "walkway"
+    }
+  ]
+}

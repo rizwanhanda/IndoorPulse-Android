@@ -60,10 +60,14 @@ class MainActivity : ComponentActivity() {
                         @Suppress("UNCHECKED_CAST")
                         override fun <T : ViewModel> create(modelClass: Class<T>): T {
                             val sensorDataSource = SensorDataSourceImpl(this@MainActivity, fusedLocationClient)
+                            val database = com.indoorpulse.data.local.IndoorPulseDatabase.getDatabase(this@MainActivity)
+                            val sensorManager = getSystemService(android.content.Context.SENSOR_SERVICE) as android.hardware.SensorManager
                             return MapViewModel(
+                                sensorManager,
                                 sensorDataSource,
                                 FindShortestPathUseCase(),
-                                ApplyGpsLeashUseCase()
+                                ApplyGpsLeashUseCase(),
+                                database.mapDao()
                             ) as T
                         }
                     }

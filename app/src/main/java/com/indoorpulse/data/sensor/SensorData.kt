@@ -16,3 +16,9 @@ data class GpsLocation(
     val longitude: Double,
     val accuracyMeters: Float
 )
+
+data class GravityEvent(
+    val gx: Float,
+    val gy: Float,
+    val gz: Float
+)

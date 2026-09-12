@@ -22,11 +22,11 @@ class FindShortestPathUseCase {
         val startNode = map.nodes[startNodeId] ?: return emptyList()
         val targetNode = map.nodes[targetNodeId] ?: return emptyList()
 
-        // Adjacency list
         val adjacencyList = mutableMapOf<String, MutableList<Pair<String, Float>>>()
         for (edge in map.edges) {
             if (!edge.isAccessible) continue
             adjacencyList.getOrPut(edge.fromNodeId) { mutableListOf() }.add(edge.toNodeId to edge.distanceMeters)
+            adjacencyList.getOrPut(edge.toNodeId) { mutableListOf() }.add(edge.fromNodeId to edge.distanceMeters)
         }
 
         val openSet = PriorityQueue<NodeWrapper>()

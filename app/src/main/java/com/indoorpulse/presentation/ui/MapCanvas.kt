@@ -22,23 +22,46 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.graphics.PathEffect
 import com.indoorpulse.presentation.viewmodel.MapUiState
+import com.indoorpulse.data.local.entity.NodeEntity
+import com.indoorpulse.data.local.entity.EdgeEntity
+
+private fun getProjectedPoint(px: Float, py: Float, x1: Float, y1: Float, x2: Float, y2: Float): Pair<Float, Float> {
+    val l2 = (x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2)
+    if (l2 == 0f) return Pair(x1, y1)
+    val t = Math.max(0f, Math.min(1f, ((px - x1) * (x2 - x1) + (py - y1) * (y2 - y1)) / l2))
+    return Pair(x1 + t * (x2 - x1), y1 + t * (y2 - y1))
+}
+
+private fun distanceTo(x1: Float, y1: Float, x2: Float, y2: Float): Float {
+    return Math.hypot((x2 - x1).toDouble(), (y2 - y1).toDouble()).toFloat()
+}
 
 @Composable
 fun MapCanvas(
     uiState: MapUiState,
+    estimatedPosition: Pair<Float, Float>,
+    isSurveyorMode: Boolean = false,
+    surveyorNodes: List<NodeEntity> = emptyList(),
+    surveyorEdges: List<EdgeEntity> = emptyList(),
+    lastDroppedNodeId: String? = null,
+    snapTargetNodeId: String? = null,
     modifier: Modifier = Modifier
 ) {
     var scale by remember { mutableStateOf(20f) }
     var offset by remember { mutableStateOf(Offset(500f, 500f)) }
+    var lastPx by remember { mutableStateOf(estimatedPosition.first) }
+    var lastPy by remember { mutableStateOf(estimatedPosition.second) }
+    var movementAngle by remember { mutableStateOf(0f) }
 
     val animatedX by animateFloatAsState(
-        targetValue = uiState.userPosition.x,
+        targetValue = estimatedPosition.first,
         animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
         label = "userX"
     )
     val animatedY by animateFloatAsState(
-        targetValue = uiState.userPosition.y,
+        targetValue = estimatedPosition.second,
         animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
         label = "userY"
     )
@@ -72,73 +95,218 @@ fun MapCanvas(
             }
     ) {
         fun projX(x: Float) = offset.x + (x * scale)
-        fun projY(y: Float) = offset.y - (y * scale) // Invert Y here because Canvas +Y is Downwards
+        fun projY(y: Float) = offset.y - (y * scale)
 
-        uiState.indoorMap.edges.forEach { edge ->
-            val fromNode = uiState.indoorMap.nodes[edge.fromNodeId]
-            val toNode = uiState.indoorMap.nodes[edge.toNodeId]
+        val userCanvasX = projX(estimatedPosition.first)
+        val userCanvasY = projY(estimatedPosition.second)
+
+        val px = estimatedPosition.first
+        val py = estimatedPosition.second
+        val distMoved = Math.hypot((px - lastPx).toDouble(), (py - lastPy).toDouble()).toFloat()
+        if (distMoved > 0.3f) { // Lowered slightly for better responsiveness
+            // atan2 gets the true screen vector. +90 aligns it with the Canvas 'Up' orientation.
+            movementAngle = (Math.toDegrees(Math.atan2((py - lastPy).toDouble(), (px - lastPx).toDouble())).toFloat() + 90f) % 360f
+            lastPx = px
+            lastPy = py
+        }
+
+            // 1. Draw all database edges
+        surveyorEdges.forEach { edge ->
+            val fromNode = surveyorNodes.find { it.nodeId == edge.fromNodeId }
+            val toNode = surveyorNodes.find { it.nodeId == edge.toNodeId }
             if (fromNode != null && toNode != null) {
                 drawLine(
-                    color = Color.DarkGray,
-                    start = Offset(projX(fromNode.coordinate.x), projY(fromNode.coordinate.y)),
-                    end = Offset(projX(toNode.coordinate.x), projY(toNode.coordinate.y)),
-                    strokeWidth = 5f
+                    color = Color(0xFF708090), // Slate Gray
+                    start = Offset(projX(fromNode.x), projY(fromNode.y)),
+                    end = Offset(projX(toNode.x), projY(toNode.y)),
+                    strokeWidth = 4f * scale * 0.1f // relative to scale or fixed? instructions: stroke width: 4.dp (just use 8f absolute to keep it simple, or `8f * density`)
+                ) // Let's just use fixed pixel size for lines since the instructions just said 4.dp. 
+                // We'll use 8f to roughly match.
+            }
+        }
+        
+        surveyorEdges.forEach { edge ->
+            val fromNode = surveyorNodes.find { it.nodeId == edge.fromNodeId }
+            val toNode = surveyorNodes.find { it.nodeId == edge.toNodeId }
+            if (fromNode != null && toNode != null) {
+                drawLine(
+                    color = Color(0xFF708090), // Slate Gray
+                    start = Offset(projX(fromNode.x), projY(fromNode.y)),
+                    end = Offset(projX(toNode.x), projY(toNode.y)),
+                    strokeWidth = 8f
                 )
             }
         }
 
-        uiState.indoorMap.nodes.values.forEach { node ->
-            drawCircle(
-                color = Color.LightGray,
-                radius = 0.5f * scale,
-                center = Offset(projX(node.coordinate.x), projY(node.coordinate.y))
-            )
-        }
 
-        if (uiState.activeRoute.size >= 2) {
-            for (i in 0 until uiState.activeRoute.size - 1) {
-                val p1 = uiState.activeRoute[i]
-                val p2 = uiState.activeRoute[i + 1]
+
+        // 2. Draw Active Route over edges
+        if (!isSurveyorMode && uiState.activeRoute.isNotEmpty()) {
+            val px = estimatedPosition.first
+            val py = estimatedPosition.second
+
+            if (uiState.activeRoute.size >= 2) {
+                var closestSegmentIndex = 0
+                var bestProj = Pair(uiState.activeRoute[0].x, uiState.activeRoute[0].y)
+                var minDistToRoute = Float.MAX_VALUE
+        
+                // 1. Find the closest physical segment on the active route
+                for (i in 0 until uiState.activeRoute.size - 1) {
+                    val n1 = uiState.activeRoute[i]
+                    val n2 = uiState.activeRoute[i + 1]
+                    val proj = getProjectedPoint(px, py, n1.x, n1.y, n2.x, n2.y)
+                    val dist = distanceTo(px, py, proj.first, proj.second)
+                    if (dist < minDistToRoute) {
+                        minDistToRoute = dist
+                        closestSegmentIndex = i
+                        bestProj = proj
+                    }
+                }
+        
+                // 2. THE LIFELINE: Dashed line from user to the anchor point
+                drawLine(
+                    color = Color.Cyan.copy(alpha = 0.6f),
+                    start = Offset(projX(px), projY(py)),
+                    end = Offset(projX(bestProj.first), projY(bestProj.second)),
+                    strokeWidth = 6f,
+                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(15f, 15f), 0f)
+                )
+        
+                // 3. THE SHRINKING SEGMENT: Solid line from anchor point to the next node
+                val nextNode = uiState.activeRoute[closestSegmentIndex + 1]
                 drawLine(
                     color = Color.Cyan,
-                    start = Offset(projX(p1.x), projY(p1.y)),
-                    end = Offset(projX(p2.x), projY(p2.y)),
-                    strokeWidth = 10f
+                    start = Offset(projX(bestProj.first), projY(bestProj.second)),
+                    end = Offset(projX(nextNode.x), projY(nextNode.y)),
+                    strokeWidth = 12f
+                )
+        
+                // 4. REMAINING ROUTE: Solid lines for the rest of the path
+                for (i in closestSegmentIndex + 1 until uiState.activeRoute.size - 1) {
+                    val n1 = uiState.activeRoute[i]
+                    val n2 = uiState.activeRoute[i + 1]
+                    drawLine(
+                        color = Color.Cyan,
+                        start = Offset(projX(n1.x), projY(n1.y)),
+                        end = Offset(projX(n2.x), projY(n2.y)),
+                        strokeWidth = 12f
+                    )
+                }
+            } else {
+                // Final destination stretch
+                val dest = uiState.activeRoute[0]
+                drawLine(
+                    color = Color.Cyan.copy(alpha = 0.6f),
+                    start = Offset(projX(px), projY(py)),
+                    end = Offset(projX(dest.x), projY(dest.y)),
+                    strokeWidth = 6f,
+                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(15f, 15f), 0f)
                 )
             }
         }
 
-        val userCanvasX = projX(animatedX)
-        val userCanvasY = projY(animatedY)
+        // 3. Draw Nodes
+        surveyorNodes.forEach { node ->
+            if (node.nodeType == "Waypoint" || node.name.isBlank()) {
+                drawCircle(
+                    color = Color.Gray,
+                    radius = 6f, // ~ 3.dp depending on scale preference
+                    center = Offset(projX(node.x), projY(node.y))
+                )
+            } else {
+                val color = when (node.nodeType) {
+                    "Junction" -> Color.Red
+                    "Room Door" -> Color.Blue
+                    "Stairs" -> Color.Green
+                    else -> Color.Yellow
+                }
+                drawCircle(
+                    color = color,
+                    radius = 12f, // 6.dp ~ 12px
+                    center = Offset(projX(node.x), projY(node.y))
+                )
+                
+                if (node.name.isNotBlank()) {
+                    drawText(
+                        textMeasurer = textMeasurer,
+                        text = node.name,
+                        topLeft = Offset(projX(node.x) - 20f, projY(node.y) - 40f), // Label above
+                        style = TextStyle(color = Color.White)
+                    )
+                }
+            }
+            
+            if (isSurveyorMode && snapTargetNodeId != null && node.nodeId == snapTargetNodeId) {
+                drawCircle(
+                    color = Color.Yellow,
+                    radius = 24f, // 12.dp hollow circle
+                    center = Offset(projX(node.x), projY(node.y)),
+                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = 6f) // 3.dp thickness
+                )
+            }
+        }
 
+        // 4. Draw Rubber-Band & Snapping (Surveyor Mode Only)
+        if (isSurveyorMode) {
+            if (snapTargetNodeId != null) {
+                val snapNode = surveyorNodes.find { it.nodeId == snapTargetNodeId }
+                if (snapNode != null) {
+                    drawLine(
+                        color = Color.Yellow,
+                        start = Offset(userCanvasX, userCanvasY),
+                        end = Offset(projX(snapNode.x), projY(snapNode.y)),
+                        strokeWidth = 6f,
+                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(15f, 15f), 0f)
+                    )
+                }
+            } else if (lastDroppedNodeId != null) {
+                val lastNode = surveyorNodes.find { it.nodeId == lastDroppedNodeId }
+                if (lastNode != null) {
+                    drawLine(
+                        color = Color.Yellow,
+                        start = Offset(projX(lastNode.x), projY(lastNode.y)),
+                        end = Offset(userCanvasX, userCanvasY),
+                        strokeWidth = 4f,
+                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f)
+                    )
+                }
+            }
+        }
+
+        // 5. Draw Position Indicator (Google Maps Puck)
+        // Outer halo
         drawCircle(
-            color = Color.Red,
-            radius = 0.8f * scale,
+            color = Color(0x40007BFF), // Translucent blue (0.25 alpha)
+            radius = 36f, // 18.dp ~ 36px
+            center = Offset(userCanvasX, userCanvasY)
+        )
+        // White border
+        drawCircle(
+            color = Color.White,
+            radius = 18f, // 9.dp (dot + border)
+            center = Offset(userCanvasX, userCanvasY)
+        )
+        // Inner solid blue dot
+        drawCircle(
+            color = Color(0xFF007BFF), // Vibrant blue
+            radius = 14f, // 7.dp ~ 14px
             center = Offset(userCanvasX, userCanvasY)
         )
 
-        val coneLength = 3f * scale
-
+        // 3. Draw the True Navigation Arrow (Google Maps Style Chevron)
         withTransform({
-            translate(userCanvasX, userCanvasY)
-            rotate(animatedHeading, Offset.Zero)
+            rotate(degrees = movementAngle, pivot = Offset(userCanvasX, userCanvasY))
         }) {
-            val conePath = Path().apply {
-                moveTo(0f, -coneLength)
-                lineTo(-coneLength * 0.5f, -coneLength * 0.2f)
-                lineTo(coneLength * 0.5f, -coneLength * 0.2f)
+            val arrowPath = Path().apply {
+                moveTo(userCanvasX, userCanvasY - 35f)             // Tip of the arrow (pointing Forward)
+                lineTo(userCanvasX + 25f, userCanvasY + 15f)       // Bottom Right
+                lineTo(userCanvasX, userCanvasY + 5f)              // Inner cutout notch
+                lineTo(userCanvasX - 25f, userCanvasY + 15f)       // Bottom Left
                 close()
             }
-            drawPath(path = conePath, color = Color(0x88FF0000))
-        }
-
-        uiState.indoorMap.nodes.values.forEach { node ->
-            drawText(
-                textMeasurer = textMeasurer,
-                text = node.label,
-                topLeft = Offset(projX(node.coordinate.x) + 10f, projY(node.coordinate.y) - 10f),
-                style = TextStyle(color = Color.White)
-            )
+            // A filled white arrow with a dark border so it pops against the map
+            drawPath(path = arrowPath, color = Color.White)
+            drawPath(path = arrowPath, color = Color.DarkGray, style = androidx.compose.ui.graphics.drawscope.Stroke(width = 2f))
         }
     }
 }
