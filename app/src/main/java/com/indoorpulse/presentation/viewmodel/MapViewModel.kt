@@ -159,6 +159,23 @@ class MapViewModel(
         _edges.value = cachedEdges
     }
 
+    private fun getUniqueNodeName(requestedName: String, existingNames: List<String>): String {
+        if (!existingNames.contains(requestedName)) {
+            return requestedName
+        }
+        
+        var counter = 2
+        var newName = "$requestedName $counter"
+        
+        // Keep incrementing until we find a clean name
+        while (existingNames.contains(newName)) {
+            counter++
+            newName = "$requestedName $counter"
+        }
+        
+        return newName
+    }
+
     fun forceDropNewNode(nodeName: String, nodeType: String) {
         viewModelScope.launch {
             try {
@@ -167,13 +184,17 @@ class MapViewModel(
                 
                 mapDao.insertFloors(listOf(FloorEntity(floorId = "f1", level = 0, name = "Ground Floor", altitudeOffsetMeters = 0f)))
                 val newNodeId = java.util.UUID.randomUUID().toString()
+                
+                val currentNames = cachedNodes.values.map { it.name }
+                val safeLabel = getUniqueNodeName(nodeName, currentNames)
+
                 val newNode = NodeEntity(
                     nodeId = newNodeId,
                     floorId = "f1",
                     x = pos.first,
                     y = pos.second,
                     nodeType = nodeType,
-                    name = nodeName
+                    name = safeLabel
                 )
                 mapDao.insertNodes(listOf(newNode))
                 actionHistory.push("NODE:${newNode.nodeId}")

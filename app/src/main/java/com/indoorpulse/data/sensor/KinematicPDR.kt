@@ -6,22 +6,20 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 
 class KinematicPDR : SensorEventListener {
-    // ---- PDR STATE ----
     private val gravity = FloatArray(3)
     private var hasGravity = false
     
-    // EMA & Adaptive Envelope State
+    // Schmitt Trigger State Machine
     private var smoothedAccel = 0f
-    private var wasAboveZero = true
-    private var currentMax = 0f
-    private var currentMin = 0f
+    private var isArmedForStep = false
+    private var currentPeak = 0f
     private var lastStepTime = 0L
     
-    // Scientifically Tuned Constants
-    private val EMA_ALPHA = 0.15f // Strips out hand shaking, preserves body bounce
+    // --- THE GOLDEN CONSTANTS ---
+    private val EMA_ALPHA = 0.12f   // Stricter low-pass to kill hand vibration
+    private val HIGH_THRES = 0.35f  // MUST bounce UP this hard (heel strike)
+    private val LOW_THRES = -0.35f  // MUST drop DOWN this hard (foot lift)
     private val WEINBERG_K = 0.55f 
-    private val MIN_STEP_TIME_MS = 280 
-    private val BOUNCE_THRESHOLD = 0.5f // Tuned down slightly to capture natural walking
     
     var currentHeading = 0f
     var onStepDetected: ((stepLength: Float, heading: Float) -> Unit)? = null
@@ -34,60 +32,61 @@ class KinematicPDR : SensorEventListener {
                 gravity[2] = event.values[2]
                 hasGravity = true
             }
-            
             Sensor.TYPE_ROTATION_VECTOR -> {
                 val rotationMatrix = FloatArray(9)
                 SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
                 val orientation = FloatArray(3)
                 SensorManager.getOrientation(rotationMatrix, orientation)
-                
-                // Flat-phone azimuth, normalized to 0-360
-                var headingDeg = Math.toDegrees(orientation[0].toDouble()).toFloat()
-                headingDeg = (headingDeg + 360f) % 360f
-                currentHeading = headingDeg
+                currentHeading = (Math.toDegrees(orientation[0].toDouble()).toFloat() + 360f) % 360f
             }
-            
             Sensor.TYPE_LINEAR_ACCELERATION -> {
                 if (!hasGravity) return
-                
                 val gMag = Math.sqrt((gravity[0]*gravity[0] + gravity[1]*gravity[1] + gravity[2]*gravity[2]).toDouble()).toFloat()
                 if (gMag == 0f) return
                 
-                // 1. Isolate raw vertical acceleration (gravity projection)
                 val rawVertical = (event.values[0]*gravity[0] + event.values[1]*gravity[1] + event.values[2]*gravity[2]) / gMag
-
-                // 2. EMA Low-Pass Filter (Isolates pure sinusoidal walking wave)
                 smoothedAccel = EMA_ALPHA * rawVertical + (1.0f - EMA_ALPHA) * smoothedAccel
 
-                // 3. Track the smooth wave's envelope
-                if (smoothedAccel > currentMax) currentMax = smoothedAccel
-                if (smoothedAccel < currentMin) currentMin = smoothedAccel
-
-                // 4. Zero-Crossing Detector (Heel Strike)
-                if (wasAboveZero && smoothedAccel < 0f) {
-                    val bounce = currentMax - currentMin
-                    
-                    if (bounce > BOUNCE_THRESHOLD) {
-                        val currentTime = System.currentTimeMillis()
-                        if (currentTime - lastStepTime > MIN_STEP_TIME_MS) {
-                            lastStepTime = currentTime
-                            
-                            // Highly stable Weinberg Stride based on filtered wave envelope
-                            val dynamicStride = WEINBERG_K * Math.pow(bounce.toDouble(), 0.25).toFloat()
-                            val finalStride = Math.max(0.4f, Math.min(1.1f, dynamicStride))
-                            
-                            onStepDetected?.invoke(finalStride, currentHeading)
-                        }
-                    }
-                    // Reset envelope for the next step wave
-                    currentMax = 0f
-                    currentMin = 0f
+                // 1. ARM THE TRIGGER (Detect upward heel strike)
+                if (smoothedAccel > HIGH_THRES) {
+                    isArmedForStep = true
+                    if (smoothedAccel > currentPeak) currentPeak = smoothedAccel
                 }
-                
-                wasAboveZero = smoothedAccel > 0f
+
+                // 2. FIRE THE STEP (Detect downward foot lift completion)
+                if (isArmedForStep && smoothedAccel < LOW_THRES) {
+                    val currentTime = System.currentTimeMillis()
+                    val stepTime = currentTime - lastStepTime
+                    
+                    // Reject impossible human rhythms (e.g. picking phone off a desk)
+                    if (stepTime in 250..1500) {
+                        val bounce = currentPeak - LOW_THRES
+                        val stepFrequency = 1000f / stepTime.toFloat()
+                        
+                        // 1. Weinberg Model (Measures the physical height of your bounce)
+                        val bounceStride = WEINBERG_K * Math.pow(bounce.toDouble(), 0.25).toFloat()
+                        
+                        // 2. Frequency Model (Measures your forward momentum/speed)
+                        // Average adult takes ~1.5 to 1.8 steps per second.
+                        val freqStride = 0.3f + (0.15f * stepFrequency)
+                        
+                        // 3. Fused Sensor Fusion (60% Bounce, 40% Momentum)
+                        // This perfectly balances heavy, slow steps with light, fast steps.
+                        val dynamicStride = (bounceStride * 0.6f) + (freqStride * 0.4f)
+                        
+                        // Hard clamp to strictly enforce physical human limits
+                        val finalStride = Math.max(0.4f, Math.min(0.85f, dynamicStride))
+                        
+                        onStepDetected?.invoke(finalStride, currentHeading)
+                    }
+                    
+                    // Reset machine for the next step
+                    lastStepTime = currentTime
+                    isArmedForStep = false
+                    currentPeak = 0f
+                }
             }
         }
     }
-
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 }

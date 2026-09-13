@@ -23,6 +23,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.unit.dp
 import com.indoorpulse.presentation.viewmodel.MapUiState
 import com.indoorpulse.data.local.entity.NodeEntity
 import com.indoorpulse.data.local.entity.EdgeEntity
@@ -51,9 +52,6 @@ fun MapCanvas(
 ) {
     var scale by remember { mutableStateOf(20f) }
     var offset by remember { mutableStateOf(Offset(500f, 500f)) }
-    var lastPx by remember { mutableStateOf(estimatedPosition.first) }
-    var lastPy by remember { mutableStateOf(estimatedPosition.second) }
-    var movementAngle by remember { mutableStateOf(0f) }
 
     val animatedX by animateFloatAsState(
         targetValue = estimatedPosition.first,
@@ -99,16 +97,6 @@ fun MapCanvas(
 
         val userCanvasX = projX(estimatedPosition.first)
         val userCanvasY = projY(estimatedPosition.second)
-
-        val px = estimatedPosition.first
-        val py = estimatedPosition.second
-        val distMoved = Math.hypot((px - lastPx).toDouble(), (py - lastPy).toDouble()).toFloat()
-        if (distMoved > 0.3f) { // Lowered slightly for better responsiveness
-            // atan2 gets the true screen vector. +90 aligns it with the Canvas 'Up' orientation.
-            movementAngle = (Math.toDegrees(Math.atan2((py - lastPy).toDouble(), (px - lastPx).toDouble())).toFloat() + 90f) % 360f
-            lastPx = px
-            lastPy = py
-        }
 
             // 1. Draw all database edges
         surveyorEdges.forEach { edge ->
@@ -273,40 +261,26 @@ fun MapCanvas(
             }
         }
 
-        // 5. Draw Position Indicator (Google Maps Puck)
-        // Outer halo
-        drawCircle(
-            color = Color(0x40007BFF), // Translucent blue (0.25 alpha)
-            radius = 36f, // 18.dp ~ 36px
-            center = Offset(userCanvasX, userCanvasY)
-        )
-        // White border
-        drawCircle(
-            color = Color.White,
-            radius = 18f, // 9.dp (dot + border)
-            center = Offset(userCanvasX, userCanvasY)
-        )
-        // Inner solid blue dot
-        drawCircle(
-            color = Color(0xFF007BFF), // Vibrant blue
-            radius = 14f, // 7.dp ~ 14px
-            center = Offset(userCanvasX, userCanvasY)
-        )
+        // 1. Draw the Blue Puck Base
+        drawCircle(color = Color.Blue, radius = 12.dp.toPx(), center = Offset(userCanvasX, userCanvasY))
 
-        // 3. Draw the True Navigation Arrow (Google Maps Style Chevron)
+        // Standard compass and Canvas both rotate clockwise. 
+        // We simply offset by 180 to match the map's orientation without mirroring the turns.
+        val visualHeading = (animatedHeading + 180f) % 360f
+
         withTransform({
-            rotate(degrees = movementAngle, pivot = Offset(userCanvasX, userCanvasY))
+            // CRITICAL FIX: Adding 180f here visually flips the drawing so the sharp tip points Forward
+            rotate(degrees = (visualHeading + 180f) % 360f, pivot = Offset(userCanvasX, userCanvasY))
         }) {
-            val arrowPath = Path().apply {
-                moveTo(userCanvasX, userCanvasY - 35f)             // Tip of the arrow (pointing Forward)
-                lineTo(userCanvasX + 25f, userCanvasY + 15f)       // Bottom Right
-                lineTo(userCanvasX, userCanvasY + 5f)              // Inner cutout notch
-                lineTo(userCanvasX - 25f, userCanvasY + 15f)       // Bottom Left
+            val arrowPath = androidx.compose.ui.graphics.Path().apply {
+                moveTo(userCanvasX, userCanvasY - 35f)             
+                lineTo(userCanvasX + 25f, userCanvasY + 15f)       
+                lineTo(userCanvasX, userCanvasY + 5f)              
+                lineTo(userCanvasX - 25f, userCanvasY + 15f)       
                 close()
             }
-            // A filled white arrow with a dark border so it pops against the map
             drawPath(path = arrowPath, color = Color.White)
-            drawPath(path = arrowPath, color = Color.DarkGray, style = androidx.compose.ui.graphics.drawscope.Stroke(width = 2f))
+            drawPath(path = arrowPath, color = Color.DarkGray, style = androidx.compose.ui.graphics.drawscope.Stroke(width = 3f))
         }
     }
 }

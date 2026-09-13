@@ -11,6 +11,10 @@ data class Particle(var x: Float, var y: Float, var weight: Float)
 
 class ParticleFilter(private val numParticles: Int = 1000) {
 
+    // The exact real-world compass degree that corresponds to "UP" on your screen.
+    // Set to 180f based on the X/Y inversion you reported.
+    private val MAP_NORTH_AZIMUTH = 180f
+
     private val random = Random()
     var particles = List(numParticles) { Particle(0f, 0f, 1f / numParticles) }
         private set
@@ -35,13 +39,19 @@ class ParticleFilter(private val numParticles: Int = 1000) {
         for (particle in particles) {
             val noisyStep = stepLength * (1.0f + (random.nextGaussian().toFloat() * 0.1f))
             
-            // 1. THE ROOT FIX: Add 180 degrees to perfectly flip the compass to match your drawn map
-            val alignedHeading = (heading + 180f + (random.nextGaussian().toFloat() * 5.0f)) % 360f
-            val headingRadians = Math.toRadians(alignedHeading.toDouble())
+            // 1. Translate World Space (True North) into Map Space (Screen Up)
+            var mapSpaceHeading = (heading - MAP_NORTH_AZIMUTH) % 360f
+            if (mapSpaceHeading < 0) mapSpaceHeading += 360f
             
-            // 2. PURE MATH: No hacked negative signs. 
-            // In Canvas: 0 degrees (Up) means X is 0, and Y subtracts (goes Up the screen).
-            particle.x += (noisyStep * Math.sin(headingRadians)).toFloat()
+            // 2. Inject Gaussian noise AFTER the frame translation
+            mapSpaceHeading += (random.nextGaussian().toFloat() * 5.0f)
+            val headingRadians = Math.toRadians(mapSpaceHeading.toDouble())
+            
+            // 3. PURE CANVAS MATH (+Y is Down). 
+            // If mapSpaceHeading is 0 (Up), X adds 0, Y subtracts step (moves Up on screen).
+            // CRITICAL FIX: The X-axis operator is now `-=` instead of `+=`.
+            // This perfectly mirrors Left and Right movement while keeping Up and Down intact.
+            particle.x -= (noisyStep * Math.sin(headingRadians)).toFloat()
             particle.y -= (noisyStep * Math.cos(headingRadians)).toFloat()
 
             if (constrainToGraph && edges.isNotEmpty() && nodesMap.isNotEmpty()) {
