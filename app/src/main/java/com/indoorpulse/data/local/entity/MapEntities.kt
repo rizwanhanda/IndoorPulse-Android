@@ -21,6 +21,15 @@ data class NodeEntity(
     val name: String = ""
 )
 
+val NodeEntity.id: String
+    get() = nodeId
+
+val NodeEntity.label: String
+    get() = if (name.isNotBlank()) name else nodeId
+
+val NodeEntity.type: String
+    get() = nodeType
+
 @Entity(tableName = "edges")
 data class EdgeEntity(
     @PrimaryKey val edgeId: String,

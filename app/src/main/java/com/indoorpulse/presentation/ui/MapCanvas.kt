@@ -9,11 +9,13 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
@@ -48,10 +50,20 @@ fun MapCanvas(
     surveyorEdges: List<EdgeEntity> = emptyList(),
     lastDroppedNodeId: String? = null,
     snapTargetNodeId: String? = null,
+    recenterTrigger: Long = 0L,
     modifier: Modifier = Modifier
 ) {
     var scale by remember { mutableStateOf(20f) }
     var offset by remember { mutableStateOf(Offset(500f, 500f)) }
+    var canvasSize by remember { mutableStateOf(androidx.compose.ui.geometry.Size.Zero) }
+
+    LaunchedEffect(recenterTrigger) {
+        if (recenterTrigger > 0L) {
+            val cx = if (canvasSize.width > 0f) canvasSize.width / 2f else 500f
+            val cy = if (canvasSize.height > 0f) canvasSize.height / 2f else 500f
+            offset = Offset(cx - (estimatedPosition.first * scale), cy + (estimatedPosition.second * scale))
+        }
+    }
 
     val animatedX by animateFloatAsState(
         targetValue = estimatedPosition.first,
@@ -84,6 +96,9 @@ fun MapCanvas(
         modifier = modifier
             .fillMaxSize()
             .background(Color(0xFF1E1E1E))
+            .onSizeChanged { size ->
+                canvasSize = androidx.compose.ui.geometry.Size(size.width.toFloat(), size.height.toFloat())
+            }
             .pointerInput(Unit) {
                 detectTransformGestures { centroid, pan, zoom, _ ->
                     scale = (scale * zoom).coerceIn(5f, 100f)

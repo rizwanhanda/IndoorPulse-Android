@@ -24,6 +24,7 @@ import com.google.android.gms.location.LocationServices
 import com.indoorpulse.data.sensor.SensorDataSourceImpl
 import com.indoorpulse.domain.usecase.ApplyGpsLeashUseCase
 import com.indoorpulse.domain.usecase.FindShortestPathUseCase
+import com.indoorpulse.presentation.ui.MainScreen
 import com.indoorpulse.presentation.ui.MapScreen
 import com.indoorpulse.presentation.viewmodel.MapViewModel
 import com.indoorpulse.ui.theme.IndoorPulseTheme
@@ -73,7 +74,7 @@ class MainActivity : ComponentActivity() {
                     }
 
                     val viewModel: MapViewModel = viewModel(factory = factory)
-                    MapScreen(viewModel = viewModel)
+                    MainScreen(viewModel = viewModel)
                 } else {
                     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         Text("Location permission is required to use this app.")

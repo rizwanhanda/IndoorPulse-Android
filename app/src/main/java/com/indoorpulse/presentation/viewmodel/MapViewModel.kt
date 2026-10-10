@@ -42,9 +42,14 @@ class MapViewModel(
     val isSurveyorMode = MutableStateFlow(false)
     val lastDroppedNodeId = MutableStateFlow<String?>(null)
     val snapTargetNodeId = MutableStateFlow<String?>(null)
+    val currentFloor = MutableStateFlow("L1")
+    val recenterTrigger = MutableStateFlow(0L)
+    val isSosActive = MutableStateFlow(false)
+    val activeDestination = MutableStateFlow<NodeEntity?>(null)
     
     private val _nodes = MutableStateFlow<List<NodeEntity>>(emptyList())
     val nodes: StateFlow<List<NodeEntity>> = _nodes.asStateFlow()
+    val allNodes: StateFlow<List<NodeEntity>> = _nodes.asStateFlow()
     
     private val _edges = MutableStateFlow<List<EdgeEntity>>(emptyList())
     val edges: StateFlow<List<EdgeEntity>> = _edges.asStateFlow()
@@ -434,6 +439,9 @@ class MapViewModel(
             (dx * dx) + (dy * dy)
         }
 
+        val destinationNode = cachedNodes[nodeId] ?: _nodes.value.find { it.nodeId == nodeId }
+        activeDestination.value = destinationNode
+
         if (startNode != null) {
             val dynamicMap = buildDynamicMap()
             
@@ -448,6 +456,10 @@ class MapViewModel(
         }
     }
 
+    fun requestRoute(nodeId: String) {
+        selectDestination(nodeId)
+    }
+
     fun resetPosition() {
         lastResetTimestamp = android.os.SystemClock.elapsedRealtime()
         
@@ -460,6 +472,9 @@ class MapViewModel(
             lastDroppedNodeId.value = null
         }
         
+        isSosActive.value = false
+        activeDestination.value = null
+        
         _uiState.update {
             it.copy(
                 userPosition = Coordinate(0f, 0f),
@@ -467,6 +482,70 @@ class MapViewModel(
                 statusMessage = "Reset position to origin",
                 activeRoute = emptyList(),
                 selectedDestinationNodeId = null
+            )
+        }
+    }
+
+    fun toggleSurveyorMode(enabled: Boolean? = null) {
+        isSurveyorMode.value = enabled ?: !isSurveyorMode.value
+    }
+
+    fun switchFloor(floor: String? = null) {
+        if (floor != null) {
+            currentFloor.value = floor
+        } else {
+            currentFloor.value = if (currentFloor.value == "L1") "L2" else "L1"
+        }
+        _uiState.update { it.copy(statusMessage = "Switched to floor ${currentFloor.value}") }
+    }
+
+    fun recenterCamera() {
+        recenterTrigger.value = System.currentTimeMillis()
+    }
+
+    fun triggerEgressRouting() {
+        val exitNode = cachedNodes.values.find {
+            it.name.contains("exit", ignoreCase = true) ||
+            it.name.contains("egress", ignoreCase = true) ||
+            it.nodeType.equals("stairs", ignoreCase = true) ||
+            it.name.contains("stairs", ignoreCase = true)
+        } ?: cachedNodes.values.firstOrNull()
+
+        if (exitNode != null) {
+            isSosActive.value = true
+            selectDestination(exitNode.nodeId)
+            _uiState.update {
+                it.copy(statusMessage = "EMERGENCY: Evacuation route to ${exitNode.name}")
+            }
+        } else {
+            _uiState.update {
+                it.copy(statusMessage = "EMERGENCY: No egress destination found")
+            }
+        }
+    }
+
+    fun toggleSosMode(isActive: Boolean) {
+        isSosActive.value = isActive
+        if (isActive) {
+            triggerEgressRouting()
+        } else {
+            clearDestination()
+            _uiState.update { it.copy(statusMessage = "SOS deactivated") }
+        }
+    }
+
+    fun clearRoute() {
+        clearDestination()
+    }
+
+    fun clearDestination() {
+        isSosActive.value = false
+        activeDestination.value = null
+        _uiState.update {
+            it.copy(
+                selectedDestinationNodeId = null,
+                activeRoute = emptyList(),
+                statusMessage = "Navigation stopped"
             )
         }
     }
