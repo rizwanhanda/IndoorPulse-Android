@@ -5,5 +5,9 @@ data class Coordinate(
     val y: Float,
     val floor: Int = 1,
     val lat: Double? = null,
-    val lng: Double? = null
+    val lng: Double? = null,
+    val type: String = "Stairs"
 )
+
+val Coordinate.floorLevel: Int
+    get() = floor

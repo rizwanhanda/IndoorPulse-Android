@@ -13,7 +13,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
-@Database(entities = [FloorEntity::class, NodeEntity::class, EdgeEntity::class], version = 1, exportSchema = false)
+@Database(entities = [FloorEntity::class, NodeEntity::class, EdgeEntity::class], version = 2, exportSchema = false)
 abstract class IndoorPulseDatabase : RoomDatabase() {
 
     abstract fun mapDao(): MapDao

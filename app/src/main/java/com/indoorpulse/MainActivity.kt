@@ -25,7 +25,6 @@ import com.indoorpulse.data.sensor.SensorDataSourceImpl
 import com.indoorpulse.domain.usecase.ApplyGpsLeashUseCase
 import com.indoorpulse.domain.usecase.FindShortestPathUseCase
 import com.indoorpulse.presentation.ui.MainScreen
-import com.indoorpulse.presentation.ui.MapScreen
 import com.indoorpulse.presentation.viewmodel.MapViewModel
 import com.indoorpulse.ui.theme.IndoorPulseTheme
 
@@ -62,7 +61,7 @@ class MainActivity : ComponentActivity() {
                         override fun <T : ViewModel> create(modelClass: Class<T>): T {
                             val sensorDataSource = SensorDataSourceImpl(this@MainActivity, fusedLocationClient)
                             val database = com.indoorpulse.data.local.IndoorPulseDatabase.getDatabase(this@MainActivity)
-                            val sensorManager = getSystemService(android.content.Context.SENSOR_SERVICE) as android.hardware.SensorManager
+                            val sensorManager = getSystemService(SENSOR_SERVICE) as android.hardware.SensorManager
                             return MapViewModel(
                                 sensorManager,
                                 sensorDataSource,

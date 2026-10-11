@@ -19,6 +19,8 @@ fun MapCanvas(
     surveyorEdges: List<EdgeEntity> = emptyList(),
     lastDroppedNodeId: String? = null,
     snapTargetNodeId: String? = null,
+    selectedNode: NodeEntity? = null,
+    onNodeSelected: ((NodeEntity?) -> Unit)? = null,
     recenterTrigger: Long = 0L,
     modifier: Modifier = Modifier,
     viewModel: MapViewModel? = null,
@@ -29,7 +31,11 @@ fun MapCanvas(
     onSizeChanged: ((IntSize) -> Unit)? = null,
     onCrosshairCoordinateChanged: ((Float, Float) -> Unit)? = null,
     allNodes: List<NodeEntity> = surveyorNodes,
-    currentPose: Pair<Float, Float>? = estimatedPosition
+    currentPose: Pair<Float, Float>? = estimatedPosition,
+    currentHeading: Float = uiState.headingDegrees,
+    currentFloor: Int = 0,
+    is3DMode: Boolean = false,
+    activeRoute: List<com.indoorpulse.domain.model.Coordinate>? = null
 ) {
     com.indoorpulse.presentation.ui.MapCanvas(
         uiState = uiState,
@@ -39,6 +45,8 @@ fun MapCanvas(
         surveyorEdges = surveyorEdges,
         lastDroppedNodeId = lastDroppedNodeId,
         snapTargetNodeId = snapTargetNodeId,
+        selectedNode = selectedNode,
+        onNodeSelected = onNodeSelected,
         recenterTrigger = recenterTrigger,
         modifier = modifier,
         viewModel = viewModel,
@@ -49,6 +57,10 @@ fun MapCanvas(
         onSizeChanged = onSizeChanged,
         onCrosshairCoordinateChanged = onCrosshairCoordinateChanged,
         allNodes = allNodes,
-        currentPose = currentPose
+        currentPose = currentPose,
+        currentHeading = currentHeading,
+        currentFloor = currentFloor,
+        is3DMode = is3DMode,
+        activeRoute = activeRoute
     )
 }
