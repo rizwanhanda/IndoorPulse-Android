@@ -146,4 +146,13 @@ class ParticleFilter(private val numParticles: Int = 1000) {
             Pair(0f, 0f)
         }
     }
+
+    fun forcePosition(newX: Float, newY: Float) {
+        // Teleport all particles to the exact new position
+        particles.forEach { particle ->
+            particle.x = newX
+            particle.y = newY
+            particle.weight = 1.0f / particles.size
+        }
+    }
 }

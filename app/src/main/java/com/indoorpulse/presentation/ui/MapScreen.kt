@@ -79,7 +79,7 @@ fun SurveyorHUD(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.horizontalScroll(rememberScrollState())
             ) {
-                listOf("Junction", "Room Door", "Stairs", "Waypoint").forEach { type ->
+                com.indoorpulse.presentation.ui.components.nodeTypes.forEach { type ->
                     FilterChip(
                         selected = selectedChip == type,
                         onClick = { selectedChip = type },

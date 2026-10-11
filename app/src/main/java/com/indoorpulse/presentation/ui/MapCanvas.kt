@@ -30,6 +30,13 @@ import com.indoorpulse.presentation.viewmodel.MapUiState
 import com.indoorpulse.data.local.entity.NodeEntity
 import com.indoorpulse.data.local.entity.EdgeEntity
 
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.ui.platform.LocalDensity
+import com.indoorpulse.data.local.entity.label
+import com.indoorpulse.presentation.viewmodel.MapViewModel
+
 private fun getProjectedPoint(px: Float, py: Float, x1: Float, y1: Float, x2: Float, y2: Float): Pair<Float, Float> {
     val l2 = (x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2)
     if (l2 == 0f) return Pair(x1, y1)
@@ -41,37 +48,104 @@ private fun distanceTo(x1: Float, y1: Float, x2: Float, y2: Float): Float {
     return Math.hypot((x2 - x1).toDouble(), (y2 - y1).toDouble()).toFloat()
 }
 
+fun findNodeAt(
+    clickOffset: Offset,
+    nodes: List<NodeEntity>,
+    canvasOffset: Offset,
+    scale: Float,
+    hitRadiusPx: Float = 48f
+): NodeEntity? {
+    return nodes.minByOrNull { node ->
+        val nodeScreenX = canvasOffset.x + (node.x * scale)
+        val nodeScreenY = canvasOffset.y - (node.y * scale)
+        val dx = clickOffset.x - nodeScreenX
+        val dy = clickOffset.y - nodeScreenY
+        dx * dx + dy * dy
+    }?.takeIf { node ->
+        val nodeScreenX = canvasOffset.x + (node.x * scale)
+        val nodeScreenY = canvasOffset.y - (node.y * scale)
+        val dx = clickOffset.x - nodeScreenX
+        val dy = clickOffset.y - nodeScreenY
+        Math.hypot(dx.toDouble(), dy.toDouble()).toFloat() <= hitRadiusPx
+    }
+}
+
 @Composable
 fun MapCanvas(
-    uiState: MapUiState,
-    estimatedPosition: Pair<Float, Float>,
+    uiState: MapUiState = MapUiState(),
+    estimatedPosition: Pair<Float, Float> = Pair(0f, 0f),
     isSurveyorMode: Boolean = false,
     surveyorNodes: List<NodeEntity> = emptyList(),
     surveyorEdges: List<EdgeEntity> = emptyList(),
     lastDroppedNodeId: String? = null,
     snapTargetNodeId: String? = null,
     recenterTrigger: Long = 0L,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    viewModel: MapViewModel? = null,
+    snackbarHostState: SnackbarHostState? = null,
+    onNodeLongClick: ((NodeEntity) -> Unit)? = null,
+    scale: Float = 20f,
+    offset: Offset = Offset(500f, 500f),
+    onTransform: ((Float, Offset) -> Unit)? = null,
+    onSizeChanged: ((androidx.compose.ui.unit.IntSize) -> Unit)? = null,
+    onCrosshairCoordinateChanged: ((Float, Float) -> Unit)? = null,
+    allNodes: List<NodeEntity> = surveyorNodes,
+    currentPose: Pair<Float, Float>? = estimatedPosition
 ) {
-    var scale by remember { mutableStateOf(20f) }
-    var offset by remember { mutableStateOf(Offset(500f, 500f)) }
-    var canvasSize by remember { mutableStateOf(androidx.compose.ui.geometry.Size.Zero) }
+    val activeNodes = if (surveyorNodes.isNotEmpty()) surveyorNodes else allNodes
+    val currentPosePosition = currentPose ?: estimatedPosition
+    val density = LocalDensity.current
+
+    val currentNodes by rememberUpdatedState(activeNodes)
+    val currentIsSurveyorMode by rememberUpdatedState(isSurveyorMode)
+    val currentOnNodeLongClick by rememberUpdatedState(onNodeLongClick)
+    val currentViewModel by rememberUpdatedState(viewModel)
+
+    var currentScale by remember { mutableStateOf(scale) }
+    var currentOffset by remember { mutableStateOf(offset) }
+    var canvasSize by remember { mutableStateOf(androidx.compose.ui.unit.IntSize.Zero) }
+
+    fun notifyCrosshair(
+        w: Int = canvasSize.width,
+        h: Int = canvasSize.height,
+        off: Offset = currentOffset,
+        sc: Float = currentScale
+    ) {
+        if (w > 0 && h > 0 && sc > 0f) {
+            val mapX = (w / 2f - off.x) / sc
+            // CRITICAL FIX: Y-Up Cartesian inversion
+            val mapY = -(h / 2f - off.y) / sc
+            onCrosshairCoordinateChanged?.invoke(mapX, mapY)
+        }
+    }
+
+    LaunchedEffect(currentScale, currentOffset, canvasSize) {
+        notifyCrosshair()
+    }
+
+    fun findNodeAt(clickOffset: Offset, nodes: List<NodeEntity>): NodeEntity? {
+        val hitRadius = with(density) { 36.dp.toPx() }
+        return findNodeAt(clickOffset, nodes, currentOffset, currentScale, hitRadius)
+    }
 
     LaunchedEffect(recenterTrigger) {
         if (recenterTrigger > 0L) {
-            val cx = if (canvasSize.width > 0f) canvasSize.width / 2f else 500f
-            val cy = if (canvasSize.height > 0f) canvasSize.height / 2f else 500f
-            offset = Offset(cx - (estimatedPosition.first * scale), cy + (estimatedPosition.second * scale))
+            val cx = if (canvasSize.width > 0) canvasSize.width / 2f else 500f
+            val cy = if (canvasSize.height > 0) canvasSize.height / 2f else 500f
+            val newOffset = Offset(cx - (currentPosePosition.first * currentScale), cy + (currentPosePosition.second * currentScale))
+            currentOffset = newOffset
+            notifyCrosshair(off = newOffset)
+            onTransform?.invoke(currentScale, newOffset)
         }
     }
 
     val animatedX by animateFloatAsState(
-        targetValue = estimatedPosition.first,
+        targetValue = currentPosePosition.first,
         animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
         label = "userX"
     )
     val animatedY by animateFloatAsState(
-        targetValue = estimatedPosition.second,
+        targetValue = currentPosePosition.second,
         animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
         label = "userY"
     )
@@ -97,21 +171,46 @@ fun MapCanvas(
             .fillMaxSize()
             .background(Color(0xFF1E1E1E))
             .onSizeChanged { size ->
-                canvasSize = androidx.compose.ui.geometry.Size(size.width.toFloat(), size.height.toFloat())
+                canvasSize = size
+                onSizeChanged?.invoke(size)
+                notifyCrosshair(w = size.width, h = size.height)
             }
             .pointerInput(Unit) {
                 detectTransformGestures { centroid, pan, zoom, _ ->
-                    scale = (scale * zoom).coerceIn(5f, 100f)
-                    val newOffset = (offset + pan - centroid) * zoom + centroid
-                    offset = newOffset
+                    val newScale = (currentScale * zoom).coerceIn(5f, 100f)
+                    val newOffset = (currentOffset + pan - centroid) * zoom + centroid
+                    currentScale = newScale
+                    currentOffset = newOffset
+                    notifyCrosshair(off = newOffset, sc = newScale)
+                    onTransform?.invoke(newScale, newOffset)
                 }
             }
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    onLongPress = { clickOffset ->
+                        if (currentIsSurveyorMode) {
+                            val clickedNode = findNodeAt(clickOffset, currentNodes)
+                            if (clickedNode != null) {
+                                if (currentOnNodeLongClick != null) {
+                                    currentOnNodeLongClick?.invoke(clickedNode)
+                                } else {
+                                    currentViewModel?.stageNodeForDeletion(clickedNode)
+                                }
+                            }
+                        }
+                    }
+                )
+            }
     ) {
-        fun projX(x: Float) = offset.x + (x * scale)
-        fun projY(y: Float) = offset.y - (y * scale)
+        if (canvasSize == androidx.compose.ui.unit.IntSize.Zero) {
+            canvasSize = androidx.compose.ui.unit.IntSize(size.width.toInt(), size.height.toInt())
+        }
 
-        val userCanvasX = projX(estimatedPosition.first)
-        val userCanvasY = projY(estimatedPosition.second)
+        fun projX(x: Float) = currentOffset.x + (x * currentScale)
+        fun projY(y: Float) = currentOffset.y - (y * currentScale)
+
+        val userCanvasX = projX(currentPosePosition.first)
+        val userCanvasY = projY(currentPosePosition.second)
 
             // 1. Draw all database edges
         surveyorEdges.forEach { edge ->
@@ -122,7 +221,7 @@ fun MapCanvas(
                     color = Color(0xFF708090), // Slate Gray
                     start = Offset(projX(fromNode.x), projY(fromNode.y)),
                     end = Offset(projX(toNode.x), projY(toNode.y)),
-                    strokeWidth = 4f * scale * 0.1f // relative to scale or fixed? instructions: stroke width: 4.dp (just use 8f absolute to keep it simple, or `8f * density`)
+                    strokeWidth = 4f * currentScale * 0.1f // relative to scale or fixed? instructions: stroke width: 4.dp (just use 8f absolute to keep it simple, or `8f * density`)
                 ) // Let's just use fixed pixel size for lines since the instructions just said 4.dp. 
                 // We'll use 8f to roughly match.
             }
@@ -221,6 +320,9 @@ fun MapCanvas(
                     "Junction" -> Color.Red
                     "Room Door" -> Color.Blue
                     "Stairs" -> Color.Green
+                    "Washroom" -> Color(0xFF00BCD4)
+                    "Emergency Exit" -> Color(0xFFFF5722)
+                    "Building Entry" -> Color(0xFF4CAF50)
                     else -> Color.Yellow
                 }
                 drawCircle(

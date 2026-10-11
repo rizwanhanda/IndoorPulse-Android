@@ -16,9 +16,18 @@ import com.indoorpulse.data.local.entity.EdgeEntity
 import com.indoorpulse.data.local.entity.FloorEntity
 import com.indoorpulse.data.local.entity.NodeEntity
 import com.indoorpulse.domain.navigation.ParticleFilter
+import com.indoorpulse.data.local.entity.id
+import com.indoorpulse.data.local.entity.label
+import com.indoorpulse.data.local.entity.type
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlin.math.abs
@@ -26,6 +35,12 @@ import kotlin.math.cos
 import kotlin.math.sin
 
 enum class ViewMode { MAP_2D, AR_CAMERA }
+
+sealed interface SurveyorAction {
+    data class DeleteNode(val node: NodeEntity) : SurveyorAction
+    data class DropNode(val node: NodeEntity, val edge: EdgeEntity?) : SurveyorAction
+    data class SnapEdge(val edge: EdgeEntity) : SurveyorAction
+}
 
 class MapViewModel(
     private val sensorManager: android.hardware.SensorManager,
@@ -39,17 +54,138 @@ class MapViewModel(
     val isAutoArEnabled = MutableStateFlow(true)
     val estimatedPosition = MutableStateFlow(Pair(0f, 0f))
     
-    val isSurveyorMode = MutableStateFlow(false)
+    private val _isSurveyorMode = MutableStateFlow(false)
+    val isSurveyorMode: StateFlow<Boolean> = _isSurveyorMode.asStateFlow()
     val lastDroppedNodeId = MutableStateFlow<String?>(null)
     val snapTargetNodeId = MutableStateFlow<String?>(null)
     val currentFloor = MutableStateFlow("L1")
     val recenterTrigger = MutableStateFlow(0L)
-    val isSosActive = MutableStateFlow(false)
+    private val _isSosActive = MutableStateFlow(false)
+    val isSosActive: StateFlow<Boolean> = _isSosActive.asStateFlow()
     val activeDestination = MutableStateFlow<NodeEntity?>(null)
     
     private val _nodes = MutableStateFlow<List<NodeEntity>>(emptyList())
-    val nodes: StateFlow<List<NodeEntity>> = _nodes.asStateFlow()
-    val allNodes: StateFlow<List<NodeEntity>> = _nodes.asStateFlow()
+    private val _undoStack = MutableStateFlow<List<SurveyorAction>>(emptyList())
+    private val _redoStack = MutableStateFlow<List<SurveyorAction>>(emptyList())
+
+    val canUndo: StateFlow<Boolean> = _undoStack.map { it.isNotEmpty() }.stateIn(viewModelScope, SharingStarted.Lazily, false)
+    val canRedo: StateFlow<Boolean> = _redoStack.map { it.isNotEmpty() }.stateIn(viewModelScope, SharingStarted.Lazily, false)
+
+    inner class Repository {
+        fun getAllNodesFlow(): Flow<List<NodeEntity>> = _nodes
+        suspend fun deleteNodeAndEdges(nodeId: String) {
+            mapDao.deleteEdgesForNode(nodeId)
+            mapDao.deleteNode(nodeId)
+        }
+    }
+    val repository = Repository()
+
+    fun stageNodeForDeletion(node: NodeEntity) {
+        // Pushing a new deletion clears the redo future
+        _undoStack.value = _undoStack.value + SurveyorAction.DeleteNode(node)
+        _redoStack.value = emptyList()
+        if (lastDroppedNodeId.value == node.nodeId) {
+            lastDroppedNodeId.value = null
+        }
+        if (snapTargetNodeId.value == node.nodeId) {
+            snapTargetNodeId.value = null
+        }
+    }
+
+    fun performUndo() {
+        val stack = _undoStack.value
+        if (stack.isEmpty()) return
+        val action = stack.last()
+        _undoStack.value = stack.dropLast(1)
+        _redoStack.value = _redoStack.value + action
+
+        viewModelScope.launch(Dispatchers.IO) {
+            when (action) {
+                is SurveyorAction.DeleteNode -> {
+                    // Restored to activeNodes automatically because it's no longer in DeleteNode actions
+                }
+                is SurveyorAction.DropNode -> {
+                    try {
+                        mapDao.deleteNode(action.node.nodeId)
+                        if (action.edge != null) {
+                            mapDao.deleteEdge(action.edge.edgeId)
+                        }
+                        droppedNodesChain.remove(action.node.nodeId)
+                        lastDroppedNodeId.value = droppedNodesChain.lastOrNull()
+                        refreshCache()
+                    } catch (e: Exception) {
+                        _uiState.update { it.copy(statusMessage = "Undo drop failed: ${e.message}") }
+                    }
+                }
+                is SurveyorAction.SnapEdge -> {
+                    try {
+                        mapDao.deleteEdge(action.edge.edgeId)
+                        droppedNodesChain.remove(action.edge.toNodeId)
+                        lastDroppedNodeId.value = action.edge.fromNodeId
+                        refreshCache()
+                    } catch (e: Exception) {
+                        _uiState.update { it.copy(statusMessage = "Undo snap failed: ${e.message}") }
+                    }
+                }
+            }
+        }
+    }
+
+    fun performRedo() {
+        val stack = _redoStack.value
+        if (stack.isEmpty()) return
+        val action = stack.last()
+        _redoStack.value = stack.dropLast(1)
+        _undoStack.value = _undoStack.value + action
+
+        viewModelScope.launch(Dispatchers.IO) {
+            when (action) {
+                is SurveyorAction.DeleteNode -> {
+                    // Staged deletion reapplied automatically because it's back in _undoStack
+                }
+                is SurveyorAction.DropNode -> {
+                    try {
+                        mapDao.insertNodes(listOf(action.node))
+                        if (action.edge != null) {
+                            mapDao.insertEdges(listOf(action.edge))
+                        }
+                        droppedNodesChain.add(action.node.nodeId)
+                        lastDroppedNodeId.value = action.node.nodeId
+                        refreshCache()
+                    } catch (e: Exception) {
+                        _uiState.update { it.copy(statusMessage = "Redo drop failed: ${e.message}") }
+                    }
+                }
+                is SurveyorAction.SnapEdge -> {
+                    try {
+                        mapDao.insertEdges(listOf(action.edge))
+                        droppedNodesChain.add(action.edge.toNodeId)
+                        lastDroppedNodeId.value = action.edge.toNodeId
+                        refreshCache()
+                    } catch (e: Exception) {
+                        _uiState.update { it.copy(statusMessage = "Redo snap failed: ${e.message}") }
+                    }
+                }
+            }
+        }
+    }
+
+    fun undoDeletion(node: NodeEntity) {
+        performUndo()
+    }
+
+    fun undoLastNode() {
+        performUndo()
+    }
+
+    // Ensure activeNodes filters out anything currently deleted in the undoStack
+    val activeNodes: StateFlow<List<NodeEntity>> = repository.getAllNodesFlow().combine(_undoStack) { dbNodes, actions ->
+        val stagedDeletedNodes = actions.filterIsInstance<SurveyorAction.DeleteNode>().map { it.node }.toSet()
+        dbNodes.filterNot { it in stagedDeletedNodes }
+    }.stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+
+    val nodes: StateFlow<List<NodeEntity>> = activeNodes
+    val allNodes: StateFlow<List<NodeEntity>> = activeNodes
     
     private val _edges = MutableStateFlow<List<EdgeEntity>>(emptyList())
     val edges: StateFlow<List<EdgeEntity>> = _edges.asStateFlow()
@@ -191,7 +327,13 @@ class MapViewModel(
                 val newNodeId = java.util.UUID.randomUUID().toString()
                 
                 val currentNames = cachedNodes.values.map { it.name }
-                val safeLabel = getUniqueNodeName(nodeName, currentNames)
+                val finalLabel = if (nodeName.isNotBlank()) {
+                    getUniqueNodeName(nodeName.trim(), currentNames)
+                } else {
+                    val currentNodes = if (activeNodes.value.isNotEmpty()) activeNodes.value else cachedNodes.values.toList()
+                    val count = currentNodes.count { it.type.equals(nodeType, ignoreCase = true) }
+                    "$nodeType ${count + 1}"
+                }
 
                 val newNode = NodeEntity(
                     nodeId = newNodeId,
@@ -199,11 +341,10 @@ class MapViewModel(
                     x = pos.first,
                     y = pos.second,
                     nodeType = nodeType,
-                    name = safeLabel
+                    name = finalLabel
                 )
                 mapDao.insertNodes(listOf(newNode))
-                actionHistory.push("NODE:${newNode.nodeId}")
-                
+                var createdEdge: EdgeEntity? = null
                 if (lastId != null) {
                     val lastNode = cachedNodes[lastId]
                     val length = if (lastNode != null) {
@@ -222,11 +363,13 @@ class MapViewModel(
                         edgeType = "corridor"
                     )
                     mapDao.insertEdges(listOf(newEdge))
-                    actionHistory.push("EDGE:${newEdge.edgeId}")
+                    createdEdge = newEdge
                 }
                 
                 droppedNodesChain.add(newNodeId)
                 lastDroppedNodeId.value = newNodeId
+                _undoStack.value = _undoStack.value + SurveyorAction.DropNode(newNode, createdEdge)
+                _redoStack.value = emptyList()
                 refreshCache()
             } catch (e: Exception) {
                 _uiState.update { it.copy(statusMessage = "Error saving: ${e.message}") }
@@ -260,39 +403,15 @@ class MapViewModel(
                         edgeType = "corridor"
                     )
                     mapDao.insertEdges(listOf(newEdge))
-                    actionHistory.push("EDGE:${newEdge.edgeId}")
                     
                     droppedNodesChain.add(targetId)
                     lastDroppedNodeId.value = targetId
+                    _undoStack.value = _undoStack.value + SurveyorAction.SnapEdge(newEdge)
+                    _redoStack.value = emptyList()
                     refreshCache()
                 }
             } catch (e: Exception) {
                 _uiState.update { it.copy(statusMessage = "Error snapping: ${e.message}") }
-            }
-        }
-    }
-
-    fun undoLastNode() {
-        if (actionHistory.isEmpty()) return
-        val lastAction = actionHistory.pop()
-        
-        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-            try {
-                if (lastAction.startsWith("NODE:")) {
-                    val id = lastAction.substringAfter(":")
-                    mapDao.deleteNode(id)
-                    droppedNodesChain.remove(id)
-                } else if (lastAction.startsWith("EDGE:")) {
-                    val id = lastAction.substringAfter(":")
-                    mapDao.deleteEdge(id)
-                }
-                
-                // Re-sync droppedNodesChain with the latest node if a node was undone
-                // Actually it's safer to just set lastDroppedNodeId to whatever the last node we dropped is
-                lastDroppedNodeId.value = droppedNodesChain.lastOrNull()
-                refreshCache()
-            } catch (e: Exception) {
-                _uiState.update { it.copy(statusMessage = "Undo failed: ${e.message}") }
             }
         }
     }
@@ -433,6 +552,9 @@ class MapViewModel(
     }
 
     fun selectDestination(nodeId: String) {
+        if (_isSurveyorMode.value) {
+            toggleSurveyorMode(false)
+        }
         val startNode = cachedNodes.values.minByOrNull { node ->
             val dx = node.x - _uiState.value.userPosition.x
             val dy = node.y - _uiState.value.userPosition.y
@@ -472,7 +594,7 @@ class MapViewModel(
             lastDroppedNodeId.value = null
         }
         
-        isSosActive.value = false
+        _isSosActive.value = false
         activeDestination.value = null
         
         _uiState.update {
@@ -486,8 +608,57 @@ class MapViewModel(
         }
     }
 
-    fun toggleSurveyorMode(enabled: Boolean? = null) {
-        isSurveyorMode.value = enabled ?: !isSurveyorMode.value
+    fun syncPositionTo(x: Float, y: Float) {
+        particleFilter.forcePosition(x, y)
+        val pos = Pair(x, y)
+        estimatedPosition.value = pos
+        _uiState.update { 
+            it.copy(
+                userPosition = Coordinate(x, y),
+                statusMessage = "Position synced to (%.1f, %.1f)".format(x, y)
+            ) 
+        }
+        if (isSurveyorMode.value) {
+            val lastId = lastDroppedNodeId.value
+            val closestSnappable = cachedNodes.values
+                .filter { it.nodeId != lastId }
+                .minByOrNull { node ->
+                    val dX = node.x - pos.first
+                    val dY = node.y - pos.second
+                    (dX * dX) + (dY * dY)
+                }
+            val snapDist = if (closestSnappable != null) {
+                val dX = closestSnappable.x - pos.first
+                val dY = closestSnappable.y - pos.second
+                kotlin.math.sqrt((dX * dX + dY * dY).toDouble()).toFloat()
+            } else Float.MAX_VALUE
+            
+            if (closestSnappable != null && snapDist <= 3.5f) {
+                snapTargetNodeId.value = closestSnappable.nodeId
+            } else {
+                snapTargetNodeId.value = null
+            }
+        }
+    }
+
+    fun toggleSurveyorMode(isActive: Boolean = !_isSurveyorMode.value) {
+        _isSurveyorMode.value = isActive
+        if (isActive) {
+            // Entering Surveyor: Interlock - kill active routes
+            clearRoute()
+            _isSosActive.value = false
+        } else {
+            // Exiting Surveyor: Commit staged deletions permanently to Room DB
+            viewModelScope.launch(Dispatchers.IO) {
+                val stagedDeletions = _undoStack.value.filterIsInstance<SurveyorAction.DeleteNode>().map { it.node }
+                stagedDeletions.forEach { node ->
+                    repository.deleteNodeAndEdges(node.id)
+                }
+                _undoStack.value = emptyList()
+                _redoStack.value = emptyList()
+                refreshCache()
+            }
+        }
     }
 
     fun switchFloor(floor: String? = null) {
@@ -505,6 +676,7 @@ class MapViewModel(
 
     fun triggerEgressRouting() {
         val exitNode = cachedNodes.values.find {
+            it.nodeType == "Emergency Exit" ||
             it.name.contains("exit", ignoreCase = true) ||
             it.name.contains("egress", ignoreCase = true) ||
             it.nodeType.equals("stairs", ignoreCase = true) ||
@@ -512,7 +684,7 @@ class MapViewModel(
         } ?: cachedNodes.values.firstOrNull()
 
         if (exitNode != null) {
-            isSosActive.value = true
+            _isSosActive.value = true
             selectDestination(exitNode.nodeId)
             _uiState.update {
                 it.copy(statusMessage = "EMERGENCY: Evacuation route to ${exitNode.name}")
@@ -525,8 +697,11 @@ class MapViewModel(
     }
 
     fun toggleSosMode(isActive: Boolean) {
-        isSosActive.value = isActive
+        _isSosActive.value = isActive
         if (isActive) {
+            if (_isSurveyorMode.value) {
+                toggleSurveyorMode(false)
+            }
             triggerEgressRouting()
         } else {
             clearDestination()
@@ -539,7 +714,7 @@ class MapViewModel(
     }
 
     fun clearDestination() {
-        isSosActive.value = false
+        _isSosActive.value = false
         activeDestination.value = null
         _uiState.update {
             it.copy(

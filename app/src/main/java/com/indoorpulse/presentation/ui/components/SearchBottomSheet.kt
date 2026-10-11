@@ -8,10 +8,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.indoorpulse.data.local.entity.NodeEntity
@@ -25,9 +27,9 @@ fun SearchBottomSheetContent(
 ) {
     var searchQuery by remember { mutableStateOf("") }
     
-    // Filter the nodes dynamically as the user types
+    // CRITICAL FIX: Strip out Waypoints and filter by search query
     val filteredNodes = allNodes.filter { 
-        it.label.contains(searchQuery, ignoreCase = true) 
+        it.type != "Waypoint" && it.label.contains(searchQuery, ignoreCase = true) 
     }
 
     Column(
@@ -59,8 +61,15 @@ fun SearchBottomSheetContent(
             items(filteredNodes) { node ->
                 ListItem(
                     headlineContent = { Text(node.label, fontWeight = FontWeight.Bold) },
-                    supportingContent = { Text(if (node.type == "EXIT") "Emergency Exit" else "Standard POI") },
-                    leadingContent = { Icon(Icons.Default.LocationOn, contentDescription = "Node") },
+                    // CRITICAL FIX: Show actual type instead of fallback text
+                    supportingContent = { Text(node.type) },
+                    leadingContent = { 
+                        Icon(
+                            imageVector = if (node.type == "Emergency Exit") Icons.Default.Warning else Icons.Default.LocationOn, 
+                            contentDescription = "Node",
+                            tint = if (node.type == "Emergency Exit") Color.Red else MaterialTheme.colorScheme.onSurfaceVariant
+                        ) 
+                    },
                     modifier = Modifier.clickable { onNodeSelected(node) }
                 )
                 HorizontalDivider()
