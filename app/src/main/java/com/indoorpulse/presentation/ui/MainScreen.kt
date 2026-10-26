@@ -22,20 +22,46 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.material.icons.filled.Elevator
 import androidx.compose.material.icons.filled.Stairs
+import androidx.compose.material.icons.filled.LocationCity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.input.pointer.pointerInput
+import com.indoorpulse.data.local.entity.BuildingEntity
+import com.indoorpulse.data.local.entity.NodeEntity
 import com.indoorpulse.data.local.entity.id
 import com.indoorpulse.data.local.entity.label
 import com.indoorpulse.presentation.ui.components.EmergencyFab
 import com.indoorpulse.presentation.ui.components.NavigationBanner
 import com.indoorpulse.presentation.ui.components.SearchBottomSheetContent
-import com.indoorpulse.presentation.ui.components.SurveyorHUD
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.automirrored.filled.ExitToApp
+import androidx.compose.material.icons.automirrored.filled.Redo
+import androidx.compose.material.icons.automirrored.filled.Undo
+import androidx.compose.material.icons.filled.AddLocation
+import androidx.compose.material.icons.filled.Explore
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.text.style.TextAlign
 import com.indoorpulse.presentation.viewmodel.MapViewModel
+import com.indoorpulse.presentation.viewmodel.TrackingState
 import androidx.compose.ui.platform.LocalContext
 import android.widget.Toast
 import kotlinx.coroutines.launch
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Link
+import androidx.compose.ui.window.Dialog
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -64,6 +90,11 @@ fun MainScreen(viewModel: MapViewModel) {
     val canUndo by viewModel.canUndo.collectAsState()
     val canRedo by viewModel.canRedo.collectAsState()
     val transitInfo by viewModel.transitState.collectAsState()
+    val approachingBuilding by viewModel.approachingBuilding.collectAsState()
+    val nearExitNode by viewModel.nearExitNode.collectAsState()
+    val trackingState by viewModel.trackingState.collectAsState()
+    val stagedNode by viewModel.stagedNode.collectAsState()
+    var showManualOverrideDialog by remember { mutableStateOf(false) }
 
     var targetSyncX by remember { mutableStateOf(0f) }
     var targetSyncY by remember { mutableStateOf(0f) }
@@ -71,6 +102,136 @@ fun MainScreen(viewModel: MapViewModel) {
     var selectedNodeType by remember { mutableStateOf("Junction") }
     var showNamingDialog by remember { mutableStateOf(false) }
     var nodeNameInput by remember { mutableStateOf("") }
+
+    var entryPoints by remember { mutableStateOf<List<NodeEntity>>(emptyList()) }
+    var isLoadingEntryPoints by remember { mutableStateOf(false) }
+
+    LaunchedEffect(approachingBuilding) {
+        val building = approachingBuilding
+        if (building != null) {
+            isLoadingEntryPoints = true
+            entryPoints = viewModel.getBuildingEntryPoints(building.buildingId)
+            isLoadingEntryPoints = false
+        } else {
+            entryPoints = emptyList()
+        }
+    }
+
+    if (approachingBuilding != null) {
+        val building = approachingBuilding!!
+        AlertDialog(
+            onDismissRequest = { viewModel.approachingBuilding.value = null },
+            icon = {
+                Icon(
+                    imageVector = Icons.Default.LocationCity,
+                    contentDescription = "Building Detected",
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(36.dp)
+                )
+            },
+            title = {
+                Text(
+                    text = "Approaching ${building.name}",
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.titleLarge
+                )
+            },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "Select your entry door to calibrate indoor positioning:",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    if (isLoadingEntryPoints) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(16.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            CircularProgressIndicator(modifier = Modifier.size(28.dp))
+                        }
+                    } else if (entryPoints.isEmpty()) {
+                        Text(
+                            text = "No dedicated entrance doors mapped for this building.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color.Gray
+                        )
+                        Button(
+                            onClick = {
+                                val defaultEntry = NodeEntity(
+                                    nodeId = "entry_default_${building.buildingId}",
+                                    floorId = "f1",
+                                    x = 0f,
+                                    y = 0f,
+                                    nodeType = "Building Entry",
+                                    name = "Main Entrance",
+                                    floorLevel = 0,
+                                    buildingId = building.buildingId
+                                )
+                                viewModel.confirmBuildingEntry(building.buildingId, defaultEntry)
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Text("Enter Building (Ground Floor)")
+                        }
+                    } else {
+                        Column(
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            entryPoints.forEach { entryNode ->
+                                OutlinedButton(
+                                    onClick = {
+                                        viewModel.confirmBuildingEntry(building.buildingId, entryNode)
+                                    },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(48.dp),
+                                    shape = RoundedCornerShape(12.dp),
+                                    colors = ButtonDefaults.outlinedButtonColors(
+                                        containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.25f)
+                                    )
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = entryNode.label,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+                                        Text(
+                                            text = "Floor L${entryNode.floorLevel}",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { viewModel.approachingBuilding.value = null }) {
+                    Text("Dismiss / Not Now")
+                }
+            }
+        )
+    }
 
     if (showNamingDialog) {
         AlertDialog(
@@ -130,8 +291,8 @@ fun MainScreen(viewModel: MapViewModel) {
     ) {
         BottomSheetScaffold(
             scaffoldState = scaffoldState,
-            // CRITICAL FIX: Hide sheet if routing OR if in Surveyor Mode
-            sheetPeekHeight = if (activeDestination != null || isSurveyorMode) 0.dp else 80.dp,
+            // CRITICAL FIX: Hide sheet if OUTDOORS OR if in Surveyor Mode
+            sheetPeekHeight = if (trackingState == TrackingState.OUTDOORS || isSurveyorMode) 0.dp else 80.dp,
             sheetContainerColor = MaterialTheme.colorScheme.surface,
             sheetContent = {
                 // Only show search if we are NOT currently routing and NOT in surveyor mode
@@ -160,6 +321,26 @@ fun MainScreen(viewModel: MapViewModel) {
                             Icon(Icons.Default.Menu, contentDescription = "Menu", tint = Color.White)
                         }
                     },
+                    actions = {
+                        if (trackingState == TrackingState.OUTDOORS) {
+                            IconButton(onClick = { showManualOverrideDialog = true }) {
+                                Icon(
+                                    Icons.Default.LocationCity,
+                                    contentDescription = "Select Building",
+                                    tint = Color.White
+                                )
+                            }
+                        }
+                        if (trackingState == TrackingState.INDOORS) {
+                            IconButton(onClick = { viewModel.confirmBuildingExit() }) {
+                                Icon(
+                                    Icons.AutoMirrored.Filled.ExitToApp,
+                                    contentDescription = "Exit Building",
+                                    tint = Color.White
+                                )
+                            }
+                        }
+                    },
                     colors = TopAppBarDefaults.topAppBarColors(
                         // DYNAMIC SOS COLOR SHIFT
                         containerColor = if (isSosActive) Color.Red else MaterialTheme.colorScheme.primary,
@@ -175,8 +356,8 @@ fun MainScreen(viewModel: MapViewModel) {
                     .padding(innerPadding)
                     .background(Color(0xFF1E1E1E)) // Dark Map Background
             ) {
-
-                // 1. RENDER MAP CANVAS (using activeNodes instead of raw DB nodes)
+                if (trackingState == TrackingState.INDOORS) {
+                    // 1. RENDER MAP CANVAS (using activeNodes instead of raw DB nodes)
                 MapCanvas(
                     uiState = uiState,
                     estimatedPosition = estimatedPosition,
@@ -244,6 +425,7 @@ fun MainScreen(viewModel: MapViewModel) {
                             .imePadding() // Pushes up if keyboard opens
                     ) {
                         SurveyorHUD(
+                            viewModel = viewModel,
                             selectedNodeType = selectedNodeType,
                             onNodeTypeSelected = { selectedNodeType = it },
                             onDropNode = {
@@ -253,15 +435,13 @@ fun MainScreen(viewModel: MapViewModel) {
                                     showNamingDialog = true
                                 }
                             },
-                            onSnapToNode = { viewModel.smartSnapActivePortal() },
                             onUndo = { viewModel.performUndo() },
                             onRedo = { viewModel.performRedo() },
                             onSyncPosition = {
                                 viewModel.syncPositionTo(targetSyncX, targetSyncY)
                             },
                             canUndo = canUndo,
-                            canRedo = canRedo,
-                            isSnapEnabled = true
+                            canRedo = canRedo
                         )
                     }
                 } else {
@@ -401,7 +581,602 @@ fun MainScreen(viewModel: MapViewModel) {
                         }
                     }
                 }
+                } else {
+                    OutdoorDashboard(
+                        viewModel = viewModel,
+                        onManualOverrideClick = { showManualOverrideDialog = true }
+                    )
+                }
+            }
+        }
+    }
+
+    if (nearExitNode != null) {
+        ExitBuildingDialog(
+            nearExitNode = nearExitNode!!,
+            onConfirmExit = { viewModel.confirmBuildingExit() },
+            onDismiss = { viewModel.nearExitNode.value = null }
+        )
+    }
+
+    if (showManualOverrideDialog) {
+        ManualOverrideDialog(
+            viewModel = viewModel,
+            onDismiss = { showManualOverrideDialog = false }
+        )
+    }
+
+    if (stagedNode != null) {
+        NodeEditDialog(
+            node = stagedNode!!,
+            viewModel = viewModel,
+            onDismiss = { viewModel.clearStagedNode() }
+        )
+    }
+}
+
+@Composable
+fun ExitBuildingDialog(
+    nearExitNode: NodeEntity,
+    onConfirmExit: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(
+                text = "Leaving the building?",
+                fontWeight = FontWeight.Bold,
+                style = MaterialTheme.typography.titleLarge
+            )
+        },
+        text = {
+            Text(
+                text = "You are near ${nearExitNode.label}. Do you want to end indoor navigation and switch to outdoor mode?",
+                style = MaterialTheme.typography.bodyMedium
+            )
+        },
+        confirmButton = {
+            Button(
+                onClick = onConfirmExit,
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+            ) {
+                Text("Yes, Exit")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Stay Indoors")
+            }
+        }
+    )
+}
+
+@Composable
+fun ManualOverrideDialog(
+    viewModel: MapViewModel,
+    onDismiss: () -> Unit
+) {
+    var buildings by remember { mutableStateOf<List<BuildingEntity>>(emptyList()) }
+    var selectedBuilding by remember { mutableStateOf<BuildingEntity?>(null) }
+    var entryPoints by remember { mutableStateOf<List<NodeEntity>>(emptyList()) }
+    var isLoading by remember { mutableStateOf(false) }
+    var isAddingBuilding by remember { mutableStateOf(false) }
+    var newBuildingName by remember { mutableStateOf("") }
+    var newBuildingRadius by remember { mutableStateOf("100") }
+    val coroutineScope = rememberCoroutineScope()
+
+    LaunchedEffect(Unit) {
+        isLoading = true
+        buildings = viewModel.getAllBuildings()
+        isLoading = false
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(
+                text = if (selectedBuilding == null) "Select Building" else "Select Entry: ${selectedBuilding!!.name}",
+                fontWeight = FontWeight.Bold,
+                style = MaterialTheme.typography.titleLarge
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (isLoading) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(28.dp))
+                    }
+                } else if (selectedBuilding == null) {
+                    OutlinedButton(
+                        onClick = { isAddingBuilding = !isAddingBuilding },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Text(if (isAddingBuilding) "Cancel" else "➕ Add New Building")
+                    }
+
+                    if (isAddingBuilding) {
+                        OutlinedTextField(
+                            value = newBuildingName,
+                            onValueChange = { newBuildingName = it },
+                            label = { Text("Building Name") },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true
+                        )
+                        OutlinedTextField(
+                            value = newBuildingRadius,
+                            onValueChange = { newBuildingRadius = it },
+                            label = { Text("Geofence Radius (meters)") },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                        )
+                        Button(
+                            onClick = {
+                                if (newBuildingName.isNotBlank()) {
+                                    viewModel.createNewBuilding(
+                                        newBuildingName,
+                                        newBuildingRadius.toFloatOrNull() ?: 100f
+                                    )
+                                    onDismiss()
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Text("Save & Enter Building")
+                        }
+                    }
+
+                    Text(
+                        text = "Choose a building to enter manually:",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (buildings.isEmpty()) {
+                        Text(
+                            text = "No buildings found in database.",
+                            color = Color.Gray,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    } else {
+                        Column(
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            buildings.forEach { building ->
+                                OutlinedButton(
+                                    onClick = {
+                                        selectedBuilding = building
+                                        coroutineScope.launch {
+                                            isLoading = true
+                                            entryPoints = viewModel.getBuildingEntryPoints(building.buildingId)
+                                            isLoading = false
+                                        }
+                                    },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(48.dp),
+                                    shape = RoundedCornerShape(12.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(building.name, fontWeight = FontWeight.SemiBold)
+                                        Text("${building.geofenceRadius.toInt()}m", style = MaterialTheme.typography.labelSmall)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    val building = selectedBuilding!!
+                    Text(
+                        text = "Select your entry door:",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (entryPoints.isEmpty()) {
+                        Text(
+                            text = "No dedicated doors mapped. Enter at ground level.",
+                            color = Color.Gray,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Button(
+                            onClick = {
+                                val fallbackNode = NodeEntity(
+                                    nodeId = "entry_manual_${building.buildingId}",
+                                    floorId = "f1",
+                                    x = 0f,
+                                    y = 0f,
+                                    nodeType = "Building Entry",
+                                    name = "Main Entrance",
+                                    floorLevel = 0,
+                                    buildingId = building.buildingId
+                                )
+                                viewModel.manualOverride(building.buildingId, fallbackNode)
+                                onDismiss()
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Text("Enter Building (Ground Floor)")
+                        }
+                    } else {
+                        Column(
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            entryPoints.forEach { entryNode ->
+                                Button(
+                                    onClick = {
+                                        viewModel.manualOverride(building.buildingId, entryNode)
+                                        onDismiss()
+                                    },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(48.dp),
+                                    shape = RoundedCornerShape(12.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(entryNode.label, fontWeight = FontWeight.SemiBold)
+                                        Text("Floor L${entryNode.floorLevel}", style = MaterialTheme.typography.labelMedium)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (selectedBuilding != null) {
+                    TextButton(onClick = { selectedBuilding = null }) {
+                        Text("Back")
+                    }
+                }
+                TextButton(onClick = onDismiss) {
+                    Text("Cancel")
+                }
+            }
+        }
+    )
+}
+
+@Composable
+fun SurveyorHUD(
+    viewModel: MapViewModel,
+    selectedNodeType: String,
+    onNodeTypeSelected: (String) -> Unit,
+    onDropNode: () -> Unit,
+    onUndo: () -> Unit,
+    onRedo: () -> Unit,
+    onSyncPosition: () -> Unit = {},
+    modifier: Modifier = Modifier,
+    canUndo: Boolean = true,
+    canRedo: Boolean = true
+) {
+    val selectedNode by viewModel.selectedNode.collectAsState()
+    val isPortal = selectedNode != null && (
+        selectedNode!!.nodeType.equals("Stairs", ignoreCase = true) ||
+        selectedNode!!.nodeType.equals("Elevator", ignoreCase = true)
+    )
+
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(bottom = 32.dp, start = 16.dp, end = 16.dp),
+        shape = RoundedCornerShape(24.dp),
+        color = Color(0xFF2C2C2C),
+        shadowElevation = 8.dp
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            // ROW 1: Scrollable Node Types
+            val types = listOf("Waypoint", "Junction", "Room Door", "Washroom", "Stairs", "Emergency Exit", "Building Entry")
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                types.forEach { type ->
+                    FilterChip(
+                        selected = selectedNodeType == type,
+                        onClick = { onNodeTypeSelected(type) },
+                        label = { Text(type, style = MaterialTheme.typography.labelSmall) }
+                    )
+                }
+            }
+
+            // ROW 2: Actions
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    modifier = Modifier
+                        .weight(1f, fill = false)
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(
+                        onClick = onSyncPosition,
+                        modifier = Modifier.background(Color.Red.copy(alpha = 0.2f), CircleShape).size(40.dp)
+                    ) {
+                        Icon(Icons.Default.MyLocation, contentDescription = "Sync", tint = Color.Red)
+                    }
+                    IconButton(
+                        onClick = { viewModel.undoLastNode() },
+                        enabled = canUndo,
+                        modifier = Modifier.size(40.dp)
+                    ) {
+                        Icon(Icons.AutoMirrored.Filled.Undo, contentDescription = "Undo", tint = if (canUndo) Color.White else Color.Gray)
+                    }
+                    IconButton(
+                        onClick = { viewModel.stageNodeForDeletion(selectedNode!!) },
+                        enabled = selectedNode != null,
+                        modifier = Modifier.size(40.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.Edit,
+                            contentDescription = "Edit Selected",
+                            tint = if (selectedNode != null) MaterialTheme.colorScheme.primary else Color.Gray
+                        )
+                    }
+                    
+                    if (isPortal) {
+                        OutlinedButton(
+                            onClick = { viewModel.extrudePortal(1) },
+                            contentPadding = PaddingValues(horizontal = 8.dp)
+                        ) { Text("L+1", style = MaterialTheme.typography.labelSmall) }
+                        OutlinedButton(
+                            onClick = { viewModel.extrudePortal(-1) },
+                            contentPadding = PaddingValues(horizontal = 8.dp)
+                        ) { Text("L-1", style = MaterialTheme.typography.labelSmall) }
+                    }
+                }
+
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedButton(
+                        onClick = { viewModel.snapToNearestNode() },
+                        shape = RoundedCornerShape(16.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp)
+                    ) {
+                        Icon(Icons.Default.Link, contentDescription = "Snap", modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("Snap", style = MaterialTheme.typography.labelSmall)
+                    }
+
+                    Button(
+                        onClick = onDropNode,
+                        shape = RoundedCornerShape(16.dp)
+                    ) {
+                        Icon(Icons.Default.AddLocation, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("Drop")
+                    }
+                }
             }
         }
     }
 }
+
+@Composable
+fun OutdoorDashboard(
+    viewModel: MapViewModel,
+    onManualOverrideClick: () -> Unit
+) {
+    val infiniteTransition = rememberInfiniteTransition(label = "pulse")
+    val scale by infiniteTransition.animateFloat(
+        initialValue = 1.0f,
+        targetValue = 1.2f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1000),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "scale"
+    )
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF1E1E1E))
+            .padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Icon(
+            imageVector = Icons.Default.Explore,
+            contentDescription = "Outdoor Mode",
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier
+                .size(120.dp)
+                .scale(scale)
+        )
+        Spacer(modifier = Modifier.height(24.dp))
+        Text(
+            text = "Outdoor Mode Active: Scanning for Geofences...",
+            style = MaterialTheme.typography.titleMedium,
+            color = Color.White,
+            fontWeight = FontWeight.SemiBold,
+            textAlign = TextAlign.Center
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = "Walk towards a registered entrance or select a building manually.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = Color.Gray,
+            textAlign = TextAlign.Center
+        )
+        Spacer(modifier = Modifier.height(32.dp))
+        OutlinedButton(
+            onClick = onManualOverrideClick,
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Default.LocationCity,
+                contentDescription = null,
+                modifier = Modifier.size(20.dp)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("View Known Buildings / Manual Entry", fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+@Composable
+fun NodeEditDialog(
+    node: NodeEntity,
+    viewModel: MapViewModel,
+    onDismiss: () -> Unit
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            shape = RoundedCornerShape(24.dp),
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 6.dp,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .padding(20.dp)
+                    .fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                // Header: Node ID & Floor
+                Column {
+                    Text(
+                        text = "Edit Node: ${node.label}",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = "ID: ${node.nodeId} | Floor: L${node.floorLevel}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.Gray
+                    )
+                }
+
+                // Type selector
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "Node Type",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    val types = listOf("Waypoint", "Junction", "Room Door", "Washroom", "Stairs", "Elevator", "Emergency Exit", "Building Entry")
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        types.forEach { type ->
+                            FilterChip(
+                                selected = node.nodeType.equals(type, ignoreCase = true),
+                                onClick = { viewModel.updateNodeType(node, type) },
+                                label = { Text(type, style = MaterialTheme.typography.labelSmall) }
+                            )
+                        }
+                    }
+                }
+
+                // Retroactive Portal Link (if Stairs or Elevator)
+                if (node.nodeType.equals("Stairs", ignoreCase = true) || node.nodeType.equals("Elevator", ignoreCase = true)) {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        HorizontalDivider()
+                        Text(
+                            text = "Retroactive Portal Link",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            OutlinedButton(
+                                onClick = {
+                                    viewModel.linkPortalToFloor(node, node.floorLevel + 1)
+                                    onDismiss()
+                                },
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Text("Link to L${node.floorLevel + 1}")
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    viewModel.linkPortalToFloor(node, node.floorLevel - 1)
+                                    onDismiss()
+                                },
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Text("Link to L${node.floorLevel - 1}")
+                            }
+                        }
+                    }
+                }
+
+                HorizontalDivider()
+
+                // Actions: Delete Node (Red OutlinedButton) & Close
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedButton(
+                        onClick = {
+                            viewModel.deleteNode(node)
+                            onDismiss()
+                        },
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.error),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("Delete Node")
+                    }
+
+                    TextButton(onClick = onDismiss) {
+                        Text("Close")
+                    }
+                }
+            }
+        }
+    }
+}
+
+

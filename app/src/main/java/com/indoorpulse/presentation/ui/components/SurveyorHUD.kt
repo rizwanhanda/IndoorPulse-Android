@@ -24,14 +24,15 @@ fun SurveyorHUD(
     selectedNodeType: String,
     onNodeTypeSelected: (String) -> Unit,
     onDropNode: () -> Unit,
-    onSnapToNode: () -> Unit,
     onUndo: () -> Unit,
     onRedo: () -> Unit,
     onSyncPosition: () -> Unit = {},
+    isPortal: Boolean = false,
+    onExtrudeUp: () -> Unit = {},
+    onExtrudeDown: () -> Unit = {},
     modifier: Modifier = Modifier,
     canUndo: Boolean = true,
-    canRedo: Boolean = true,
-    isSnapEnabled: Boolean = true
+    canRedo: Boolean = true
 ) {
     Surface(
         modifier = modifier
@@ -93,10 +94,13 @@ fun SurveyorHUD(
                     Text("Drop")
                 }
 
-                OutlinedButton(onClick = onSnapToNode, enabled = isSnapEnabled) {
-                    Icon(Icons.Default.Link, contentDescription = null)
-                    Spacer(Modifier.width(4.dp))
-                    Text("Snap")
+                if (isPortal) {
+                    OutlinedButton(onClick = onExtrudeUp) {
+                        Text("Push Up (L+1)")
+                    }
+                    OutlinedButton(onClick = onExtrudeDown) {
+                        Text("Push Down (L-1)")
+                    }
                 }
             }
         }

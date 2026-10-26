@@ -61,7 +61,7 @@ fun findNodeAt(
     nodes: List<NodeEntity>,
     canvasOffset: Offset,
     scale: Float,
-    hitRadiusPx: Float = 48f
+    hitRadiusPx: Float = 100f
 ): NodeEntity? {
     return nodes.minByOrNull { node ->
         val nodeScreenX = canvasOffset.x + (node.x * scale)
@@ -155,7 +155,7 @@ fun MapCanvas(
     }
 
     fun findNodeAt(clickOffset: Offset, nodes: List<NodeEntity>): NodeEntity? {
-        val hitRadius = with(density) { 36.dp.toPx() }
+        val hitRadius = with(density) { 160.dp.toPx() } // Massive touch tolerance for fat-finger selection (+40dp)
         val validPortals = listOf("Stairs", "Elevator", "Emergency Exit")
         val nodesToSearch = if (is3DMode) {
             nodes
@@ -166,12 +166,12 @@ fun MapCanvas(
             }
         }
         return nodesToSearch.minByOrNull { node ->
-            val pos = project(node.x, node.y, currentFloor)
+            val pos = project(node.x, node.y, node.floorLevel)
             val dx = clickOffset.x - pos.x
             val dy = clickOffset.y - pos.y
             dx * dx + dy * dy
         }?.takeIf { node ->
-            val pos = project(node.x, node.y, currentFloor)
+            val pos = project(node.x, node.y, node.floorLevel)
             val dx = clickOffset.x - pos.x
             val dy = clickOffset.y - pos.y
             Math.hypot(dx.toDouble(), dy.toDouble()).toFloat() <= hitRadius
@@ -255,19 +255,26 @@ fun MapCanvas(
                         val mapX = (tapOffset.x - currentOffset.x) / currentScale
                         val mapY = -(tapOffset.y - currentOffset.y) / currentScale
                         
-                        // Find nearest node on current floor within a generous radius (3.0 meters / ~60 pixels)
-                        val radiusThreshold = 3.0
-                        val clickedNode = currentNodes.filter { it.floorLevel == currentFloor }
-                            .minByOrNull { node ->
-                                minOf(
-                                    Math.hypot((node.x - mapX).toDouble(), (node.y - mapY).toDouble()),
-                                    Math.hypot((node.x - (mapX / 20f)).toDouble(), (node.y - (mapY / 20f)).toDouble())
-                                )
+                        // Expanded hitbox: massive touch tolerance for human fingers (16.0 meters / 160dp screen radius)
+                        val radiusThreshold = 16.0
+                        val hitRadiusPx = with(density) { 160.dp.toPx() }
+                        
+                        val candidateNodes = currentNodes.filter { 
+                            if (is3DMode) true else it.floorLevel == currentFloor 
+                        }
+
+                        val clickedNode = if (is3DMode) {
+                            findNodeAt(tapOffset, candidateNodes)
+                        } else {
+                            // Find nearest node with minimum Euclidean distance within enlarged hitbox
+                            candidateNodes.minByOrNull { node ->
+                                Math.hypot((node.x - mapX).toDouble(), (node.y - mapY).toDouble())
+                            }?.takeIf { node ->
+                                val dist = Math.hypot((node.x - mapX).toDouble(), (node.y - mapY).toDouble())
+                                val screenDist = dist * currentScale
+                                dist <= radiusThreshold || screenDist <= hitRadiusPx
                             }
-                            ?.takeIf { node ->
-                                Math.hypot((node.x - mapX).toDouble(), (node.y - mapY).toDouble()) < radiusThreshold ||
-                                Math.hypot((node.x - (mapX / 20f)).toDouble(), (node.y - (mapY / 20f)).toDouble()) < radiusThreshold
-                            }
+                        }
                             
                         currentOnNodeSelected?.invoke(clickedNode) // Will pass null if tapped empty space
                         currentViewModel?.selectNode(clickedNode)

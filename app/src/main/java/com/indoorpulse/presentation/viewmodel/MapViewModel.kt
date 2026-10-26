@@ -13,9 +13,11 @@ import com.indoorpulse.domain.usecase.FindShortestPathUseCase
 import com.indoorpulse.domain.usecase.GpsLeashResult
 import com.indoorpulse.domain.usecase.RoutingEngine
 import com.indoorpulse.data.local.dao.MapDao
+import com.indoorpulse.data.local.entity.BuildingEntity
 import com.indoorpulse.data.local.entity.EdgeEntity
 import com.indoorpulse.data.local.entity.FloorEntity
 import com.indoorpulse.data.local.entity.NodeEntity
+import com.indoorpulse.data.sensor.GpsLeashManager
 import com.indoorpulse.domain.navigation.ParticleFilter
 import com.indoorpulse.data.local.entity.id
 import com.indoorpulse.data.local.entity.label
@@ -40,12 +42,15 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import android.location.Location
 import java.util.UUID
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
 
 enum class ViewMode { MAP_2D, AR_CAMERA }
+
+enum class TrackingState { OUTDOORS, INDOORS }
 
 data class TransitInfo(
     val targetFloor: Int,
@@ -66,8 +71,19 @@ class MapViewModel(
     private val sensorDataSource: SensorDataSource,
     private val findShortestPathUseCase: FindShortestPathUseCase,
     private val applyGpsLeashUseCase: ApplyGpsLeashUseCase,
-    private val mapDao: MapDao
+    private val mapDao: MapDao,
+    private val gpsLeashManager: GpsLeashManager? = null
 ) : ViewModel() {
+
+    val trackingState = MutableStateFlow(TrackingState.OUTDOORS)
+    val nearExitNode = MutableStateFlow<NodeEntity?>(null)
+    private var entryAnchorNode: NodeEntity? = null
+    private var latestGpsLocation: Location? = null
+    private var lastEntryTimeMillis: Long = 0
+
+    private val _activeBuildingId = MutableStateFlow<String?>(null)
+    val activeBuildingId: StateFlow<String?> = _activeBuildingId.asStateFlow()
+    val approachingBuilding = MutableStateFlow<BuildingEntity?>(null)
 
     val currentViewMode = MutableStateFlow(ViewMode.MAP_2D)
     val isAutoArEnabled = MutableStateFlow(true)
@@ -79,6 +95,8 @@ class MapViewModel(
     val snapTargetNodeId = MutableStateFlow<String?>(null)
     private val _selectedNode = MutableStateFlow<NodeEntity?>(null)
     val selectedNode: StateFlow<NodeEntity?> = _selectedNode.asStateFlow()
+    private val _stagedNode = MutableStateFlow<NodeEntity?>(null)
+    val stagedNode: StateFlow<NodeEntity?> = _stagedNode.asStateFlow()
 
     private val _transitState = MutableStateFlow<TransitInfo?>(null)
     val transitState: StateFlow<TransitInfo?> = _transitState.asStateFlow()
@@ -145,14 +163,71 @@ class MapViewModel(
     val repository = Repository()
 
     fun stageNodeForDeletion(node: NodeEntity) {
-        // Pushing a new deletion clears the redo future
-        _undoStack.value = _undoStack.value + SurveyorAction.DeleteNode(node)
-        _redoStack.value = emptyList()
-        if (lastDroppedNodeId.value == node.nodeId) {
-            lastDroppedNodeId.value = null
+        _stagedNode.value = node
+    }
+
+    fun clearStagedNode() {
+        _stagedNode.value = null
+    }
+
+    fun deleteNode(node: NodeEntity) {
+        viewModelScope.launch(Dispatchers.IO) {
+            mapDao.deleteEdgesForNode(node.nodeId)
+            mapDao.deleteNode(node.nodeId)
+            droppedNodesChain.remove(node.nodeId)
+            if (lastDroppedNodeId.value == node.nodeId) {
+                lastDroppedNodeId.value = droppedNodesChain.lastOrNull()
+            }
+            if (snapTargetNodeId.value == node.nodeId) {
+                snapTargetNodeId.value = null
+            }
+            if (_selectedNode.value?.nodeId == node.nodeId) {
+                _selectedNode.value = null
+            }
+            clearStagedNode()
+            refreshCache(_activeBuildingId.value ?: "default_building")
+            _uiState.update { it.copy(statusMessage = "Deleted node: ${node.label}") }
         }
-        if (snapTargetNodeId.value == node.nodeId) {
-            snapTargetNodeId.value = null
+    }
+
+    fun updateNodeType(node: NodeEntity, newType: String) {
+        val updatedNode = node.copy(nodeType = newType)
+        viewModelScope.launch(Dispatchers.IO) {
+            mapDao.insertNodes(listOf(updatedNode))
+            refreshCache(_activeBuildingId.value ?: "default_building")
+            if (_stagedNode.value?.nodeId == node.nodeId) {
+                _stagedNode.value = updatedNode
+            }
+            _uiState.update { it.copy(statusMessage = "Updated ${node.label} to $newType") }
+        }
+    }
+
+    fun linkPortalToFloor(sourceNode: NodeEntity, targetFloor: Int) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val candidates = cachedNodes.values.filter {
+                it.floorLevel == targetFloor && (
+                    it.nodeType.equals("Stairs", ignoreCase = true) ||
+                    it.nodeType.equals("Elevator", ignoreCase = true)
+                )
+            }
+            val nearest = candidates.minByOrNull {
+                Math.hypot((it.x - sourceNode.x).toDouble(), (it.y - sourceNode.y).toDouble())
+            }
+            if (nearest != null) {
+                val edge = EdgeEntity(
+                    edgeId = java.util.UUID.randomUUID().toString(),
+                    fromNodeId = sourceNode.nodeId,
+                    toNodeId = nearest.nodeId,
+                    lengthMeters = 30.0f,
+                    edgeType = "vertical_portal",
+                    buildingId = sourceNode.buildingId
+                )
+                mapDao.insertEdges(listOf(edge))
+                refreshCache(_activeBuildingId.value ?: sourceNode.buildingId)
+                _uiState.update { it.copy(statusMessage = "Linked ${sourceNode.label} to ${nearest.label} on Floor L$targetFloor") }
+            } else {
+                _routeError.tryEmit("No portal found on Floor L$targetFloor")
+            }
         }
     }
 
@@ -314,7 +389,88 @@ class MapViewModel(
                     )
                 ))
             }
-            refreshCache()
+
+            var buildings = mapDao.getAllBuildings()
+            if (buildings.isEmpty()) {
+                val defaultBuilding = BuildingEntity(
+                    buildingId = "default_building",
+                    name = "Main Campus",
+                    centerLat = 0.0,
+                    centerLng = 0.0,
+                    geofenceRadius = 150f
+                )
+                mapDao.insertBuildings(listOf(defaultBuilding))
+                buildings = listOf(defaultBuilding)
+            }
+
+            val currentBuildingId = _activeBuildingId.value ?: buildings.firstOrNull()?.buildingId
+            if (currentBuildingId != null) {
+                refreshCache(currentBuildingId)
+            }
+
+            gpsLeashManager?.let { manager ->
+                var gpsJob: kotlinx.coroutines.Job? = null
+                _isSurveyorMode.collect { isSurveyor ->
+                    gpsJob?.cancel()
+                    gpsJob = viewModelScope.launch {
+                        val interval = if (isSurveyor) 5000L else 10000L
+                        manager.observeGeofences(buildings, interval).collect { event ->
+                            val detectedBuilding = event.matchedBuilding
+                            val location = event.location
+                            latestGpsLocation = location
+
+                            if (trackingState.value == TrackingState.OUTDOORS) {
+                                if (detectedBuilding != null && detectedBuilding.buildingId != _activeBuildingId.value) {
+                                    approachingBuilding.value = detectedBuilding
+                                } else {
+                                    approachingBuilding.value = null
+                                }
+                            } else {
+                                // INDOORS: Check opportunistic drift correction
+                                approachingBuilding.value = null
+                                val accuracyThreshold = if (_isSurveyorMode.value) 15.0f else 8.0f
+                                if (location.hasAccuracy() && location.accuracy < accuracyThreshold) {
+                                    val anchor = entryAnchorNode ?: cachedNodes.values.firstOrNull {
+                                        it.nodeType == "Building Entry" || it.nodeType == "Emergency Exit"
+                                    }
+
+                                    val anchorLat = anchor?.lat?.takeIf { it != 0.0 }
+                                        ?: detectedBuilding?.centerLat
+                                        ?: buildings.find { it.buildingId == _activeBuildingId.value }?.centerLat
+                                    val anchorLng = anchor?.lng?.takeIf { it != 0.0 }
+                                        ?: detectedBuilding?.centerLng
+                                        ?: buildings.find { it.buildingId == _activeBuildingId.value }?.centerLng
+
+                                    if (anchorLat != null && anchorLng != null && anchorLat != 0.0 && anchorLng != 0.0) {
+                                        val anchorX = anchor?.x ?: 0f
+                                        val anchorY = anchor?.y ?: 0f
+
+                                        val results = FloatArray(2)
+                                        Location.distanceBetween(
+                                            anchorLat,
+                                            anchorLng,
+                                            location.latitude,
+                                            location.longitude,
+                                            results
+                                        )
+                                        val distance = results[0]
+                                        val bearingDeg = results[1]
+                                        val bearingRad = Math.toRadians(bearingDeg.toDouble())
+
+                                        val deltaX = (distance * kotlin.math.sin(bearingRad)).toFloat()
+                                        val deltaY = (distance * kotlin.math.cos(bearingRad)).toFloat()
+
+                                        val correctedX = anchorX + deltaX
+                                        val correctedY = anchorY + deltaY
+
+                                        syncPositionTo(correctedX, correctedY)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         viewModelScope.launch {
@@ -394,15 +550,95 @@ class MapViewModel(
         }
     }
 
-    private suspend fun refreshCache() {
-        cachedEdges = mapDao.getAllEdges()
-        val nodesList = mapDao.getNodesByFloor("f1")
+    private suspend fun refreshCache(buildingId: String = _activeBuildingId.value ?: "default_building") {
+        val nodesList = mapDao.getNodesByBuilding(buildingId)
+        val edgesList = mapDao.getEdgesByBuilding(buildingId)
         
+        cachedEdges = edgesList
         cachedNodes = nodesList.associateBy { it.nodeId }
         
         _nodes.value = nodesList
         _edges.value = cachedEdges
         routingEngine.buildGraph(nodesList, cachedEdges)
+    }
+
+    fun confirmBuildingEntry(buildingId: String, entryNode: NodeEntity) {
+        viewModelScope.launch {
+            _activeBuildingId.value = buildingId
+            entryAnchorNode = entryNode
+            refreshCache(buildingId)
+            setFloor(entryNode.floorLevel)
+            syncPositionTo(entryNode.x, entryNode.y)
+            approachingBuilding.value = null
+            nearExitNode.value = null
+            lastEntryTimeMillis = System.currentTimeMillis()
+            trackingState.value = TrackingState.INDOORS
+        }
+    }
+
+    fun confirmBuildingExit() {
+        _activeBuildingId.value = null
+        clearRoute()
+        nearExitNode.value = null
+        entryAnchorNode = null
+        trackingState.value = TrackingState.OUTDOORS
+        _uiState.update { it.copy(statusMessage = "Exited building. Switched to OUTDOORS.") }
+    }
+
+    fun manualOverride(buildingId: String, entryNode: NodeEntity) {
+        viewModelScope.launch {
+            _activeBuildingId.value = buildingId
+            entryAnchorNode = entryNode
+            refreshCache(buildingId)
+            setFloor(entryNode.floorLevel)
+            syncPositionTo(entryNode.x, entryNode.y)
+            approachingBuilding.value = null
+            nearExitNode.value = null
+            lastEntryTimeMillis = System.currentTimeMillis()
+            trackingState.value = TrackingState.INDOORS
+            _uiState.update { it.copy(statusMessage = "Manual override: Indoors at ${entryNode.label}") }
+        }
+    }
+
+    fun createNewBuilding(name: String, radius: Float = 100f) {
+        val newBuildingId = java.util.UUID.randomUUID().toString()
+        val lat = latestGpsLocation?.latitude 
+            ?: _uiState.value.userPosition.lat.takeIf { it != 0.0 } 
+            ?: 0.0
+        val lng = latestGpsLocation?.longitude 
+            ?: _uiState.value.userPosition.lng.takeIf { it != 0.0 } 
+            ?: 0.0
+
+        val newBuilding = BuildingEntity(
+            buildingId = newBuildingId,
+            name = name.ifBlank { "New Building" },
+            centerLat = lat,
+            centerLng = lng,
+            geofenceRadius = radius
+        )
+
+        viewModelScope.launch {
+            mapDao.insertBuildings(listOf(newBuilding))
+            _activeBuildingId.value = newBuildingId
+            lastEntryTimeMillis = System.currentTimeMillis()
+            trackingState.value = TrackingState.INDOORS
+            approachingBuilding.value = null
+            nearExitNode.value = null
+            refreshCache(newBuildingId)
+            setFloor(0)
+            resetPosition()
+            _uiState.update { 
+                it.copy(statusMessage = "Created & switched to: ${newBuilding.name}") 
+            }
+        }
+    }
+
+    suspend fun getBuildingEntryPoints(buildingId: String): List<NodeEntity> {
+        return mapDao.getEntryPoints(buildingId)
+    }
+
+    fun dismissApproachingBuilding() {
+        approachingBuilding.value = null
     }
 
     val validPortals = listOf("Stairs", "Elevator", "Emergency Exit")
@@ -441,7 +677,8 @@ class MapViewModel(
             fromNodeId = nodeA.nodeId,
             toNodeId = nodeB.nodeId,
             lengthMeters = length,
-            edgeType = edgeType
+            edgeType = edgeType,
+            buildingId = _activeBuildingId.value ?: "default_building"
         )
     }
 
@@ -510,6 +747,30 @@ class MapViewModel(
                     "$nodeType ${count + 1}"
                 }
 
+                var computedLat = 0.0
+                var computedLng = 0.0
+
+                if (_isSurveyorMode.value) {
+                    val anchor = entryAnchorNode ?: cachedNodes.values.firstOrNull {
+                        it.nodeType == "Building Entry" || it.nodeType == "Emergency Exit"
+                    }
+                    val anchorLat = anchor?.lat?.takeIf { it != 0.0 }
+                    val anchorLng = anchor?.lng?.takeIf { it != 0.0 }
+
+                    if (anchorLat != null && anchorLng != null) {
+                        val anchorX = anchor.x
+                        val anchorY = anchor.y
+                        val deltaX = (pos.first - anchorX).toDouble()
+                        val deltaY = (pos.second - anchorY).toDouble()
+
+                        val deltaLat = deltaY / 111139.0
+                        val deltaLng = deltaX / (111139.0 * kotlin.math.cos(Math.toRadians(anchorLat)))
+
+                        computedLat = anchorLat + deltaLat
+                        computedLng = anchorLng + deltaLng
+                    }
+                }
+
                 val newNode = NodeEntity(
                     nodeId = newNodeId,
                     floorId = "f1",
@@ -517,7 +778,10 @@ class MapViewModel(
                     y = pos.second,
                     nodeType = nodeType,
                     name = finalLabel,
-                    floorLevel = _currentFloor.value
+                    floorLevel = _currentFloor.value,
+                    buildingId = _activeBuildingId.value ?: "default_building",
+                    lat = computedLat,
+                    lng = computedLng
                 )
                 mapDao.insertNodes(listOf(newNode))
                 var createdEdge: EdgeEntity? = null
@@ -544,65 +808,58 @@ class MapViewModel(
         }
     }
 
-    fun smartSnapActivePortal() {
-        if (_selectedNode.value == null) {
-            val fallback = snapTargetNodeId.value?.let { id -> cachedNodes[id] ?: _nodes.value.find { it.nodeId == id } }
-                ?: lastDroppedNodeId.value?.let { id -> cachedNodes[id] ?: _nodes.value.find { it.nodeId == id } }
-            if (fallback != null) {
-                _selectedNode.value = fallback
-            }
-        }
-        val activeNode = _selectedNode.value ?: run {
-            _routeError.tryEmit("Snap failed: Select a Stair or Elevator node first.")
-            return
-        }
-        val validPortals = listOf("Stairs", "Elevator", "Emergency Exit")
-        
-        if (activeNode.type !in validPortals) {
-            _routeError.tryEmit("Snap failed: Select a Stair or Elevator node first.")
+    fun extrudePortal(direction: Int) {
+        val selected = _selectedNode.value ?: return
+        if (!selected.nodeType.equals("Stairs", ignoreCase = true) &&
+            !selected.nodeType.equals("Elevator", ignoreCase = true)) {
             return
         }
 
-        viewModelScope.launch(Dispatchers.IO) {
-            val allNodes = repository.getAllNodesFlow().first()
-            
-            // Find matching portal on adjacent floors within 5 meters (units)
-            val targetGhost = allNodes.find { 
-                it.id != activeNode.id && 
-                it.type in validPortals && 
-                Math.abs(it.floorLevel - activeNode.floorLevel) == 1 &&
-                Math.hypot((it.x - activeNode.x).toDouble(), (it.y - activeNode.y).toDouble()) < 5.0
-            }
+        viewModelScope.launch {
+            val targetFloorLevel = _currentFloor.value + direction
+            val targetFloorId = "f$targetFloorLevel"
+            val newNodeId = java.util.UUID.randomUUID().toString()
 
-            if (targetGhost != null) {
-                // Align and Link
-                val alignedNode = activeNode.copy(x = targetGhost.x, y = targetGhost.y)
-                repository.updateNode(alignedNode)
-                
-                val verticalEdge = EdgeEntity(
-                    id = UUID.randomUUID().toString(),
-                    startNodeId = alignedNode.id,
-                    endNodeId = targetGhost.id,
-                    weight = 0f
+            mapDao.insertFloors(
+                listOf(
+                    FloorEntity(
+                        floorId = targetFloorId,
+                        level = targetFloorLevel,
+                        name = if (targetFloorLevel == 0) "Ground Floor" else "Floor $targetFloorLevel",
+                        altitudeOffsetMeters = targetFloorLevel * 3.5f
+                    )
                 )
-                repository.insertEdge(verticalEdge)
-                
-                // CRITICAL FIX: The graph must be rebuilt in memory immediately
-                viewModelScope.launch(Dispatchers.IO) {
-                    // Give Room DB a millisecond to commit the transaction
-                    delay(100)
-                    val updatedNodes = repository.getAllNodesFlow().first()
-                    val updatedEdges = repository.getAllEdgesFlow().first()
-                    refreshCache()
-                    routingEngine.buildGraph(updatedNodes, updatedEdges)
-                    
-                    // Clear selection so the user knows it completed
-                    _selectedNode.value = null
-                }
-                _routeError.tryEmit("Success: Linked to ${targetGhost.label} on Floor${targetGhost.floorLevel}")
-            } else {
-                _routeError.tryEmit("Snap failed: No portal found on adjacent floor within range.")
-            }
+            )
+
+            val newNode = NodeEntity(
+                nodeId = newNodeId,
+                floorId = targetFloorId,
+                x = selected.x,
+                y = selected.y,
+                nodeType = selected.nodeType,
+                name = selected.name,
+                floorLevel = targetFloorLevel,
+                buildingId = selected.buildingId,
+                lat = selected.lat,
+                lng = selected.lng
+            )
+            mapDao.insertNodes(listOf(newNode))
+
+            val newEdge = EdgeEntity(
+                edgeId = java.util.UUID.randomUUID().toString(),
+                fromNodeId = selected.nodeId,
+                toNodeId = newNodeId,
+                lengthMeters = 0f,
+                edgeType = "vertical_portal",
+                buildingId = selected.buildingId
+            )
+            mapDao.insertEdges(listOf(newEdge))
+            _undoStack.value = _undoStack.value + SurveyorAction.DropNode(newNode, newEdge)
+
+            refreshCache(_activeBuildingId.value ?: "default_building")
+            setFloor(targetFloorLevel)
+            _selectedNode.value = newNode
+            _uiState.update { it.copy(statusMessage = "Extruded portal to floor L$targetFloorLevel") }
         }
     }
 
@@ -690,6 +947,61 @@ class MapViewModel(
         }
     }
 
+    fun snapToNearestNode() {
+        val lastId = lastDroppedNodeId.value ?: _selectedNode.value?.nodeId
+        if (lastId == null) {
+            _uiState.update { it.copy(statusMessage = "Snap failed: Drop or select a node first.") }
+            return
+        }
+
+        val (curX, curY) = estimatedPosition.value
+        val floor = _currentFloor.value
+
+        val candidates = cachedNodes.values.filter {
+            it.floorLevel == floor && it.nodeId != lastId
+        }
+
+        val nearestNode = candidates.minByOrNull {
+            Math.hypot((it.x - curX).toDouble(), (it.y - curY).toDouble())
+        }
+
+        if (nearestNode == null) {
+            _uiState.update { it.copy(statusMessage = "Snap failed: No nodes on floor L$floor.") }
+            return
+        }
+
+        val dist = Math.hypot((nearestNode.x - curX).toDouble(), (nearestNode.y - curY).toDouble())
+        if (dist > 10.0) {
+            _uiState.update { it.copy(statusMessage = "Snap failed: Nearest node is too far (%.1fm).".format(dist)) }
+            return
+        }
+
+        val lastNode = cachedNodes[lastId] ?: return
+
+        val dx = nearestNode.x - lastNode.x
+        val dy = nearestNode.y - lastNode.y
+        val weight = Math.hypot(dx.toDouble(), dy.toDouble()).toFloat().coerceAtLeast(0.1f)
+
+        val newEdge = EdgeEntity(
+            edgeId = java.util.UUID.randomUUID().toString(),
+            fromNodeId = lastNode.nodeId,
+            toNodeId = nearestNode.nodeId,
+            lengthMeters = weight,
+            edgeType = "corridor",
+            buildingId = lastNode.buildingId
+        )
+
+        viewModelScope.launch(Dispatchers.IO) {
+            mapDao.insertEdges(listOf(newEdge))
+            _undoStack.value = _undoStack.value + SurveyorAction.SnapEdge(newEdge)
+            _redoStack.value = emptyList()
+            lastDroppedNodeId.value = nearestNode.nodeId
+            _selectedNode.value = nearestNode
+            refreshCache(_activeBuildingId.value ?: "default_building")
+            _uiState.update { it.copy(statusMessage = "Snapped to ${nearestNode.label}") }
+        }
+    }
+
     private fun shortestAngleDiff(target: Float, current: Float): Float {
         var diff = (target - current) % 360f
         if (diff > 180f) diff -= 360f
@@ -713,6 +1025,11 @@ class MapViewModel(
 
         viewModelScope.launch {
             sensorDataSource.gpsLocations.collect { gps ->
+                val loc = Location("GPS").apply {
+                    latitude = gps.latitude
+                    longitude = gps.longitude
+                }
+                latestGpsLocation = loc
                 val updatedPos = _uiState.value.userPosition.copy(lat = gps.latitude, lng = gps.longitude)
                 
                 val leashResult = applyGpsLeashUseCase(
@@ -811,6 +1128,25 @@ class MapViewModel(
 
     fun onLocationUpdated(newX: Float, newY: Float) {
         if (_transitState.value != null) return // CRITICAL: Pause PDR during transit
+
+        // Exit proximity detection when INDOORS
+        if (trackingState.value == TrackingState.INDOORS) {
+            val exitNodes = cachedNodes.values.filter {
+                it.floorLevel == _currentFloor.value &&
+                (it.nodeType == "Building Entry" || it.nodeType == "Emergency Exit")
+            }
+            val closestExit = exitNodes.minByOrNull { exit ->
+                Math.hypot((newX - exit.x).toDouble(), (newY - exit.y).toDouble())
+            }
+            if (closestExit != null && (System.currentTimeMillis() - lastEntryTimeMillis > 15000)) {
+                val dist = Math.hypot((newX - closestExit.x).toDouble(), (newY - closestExit.y).toDouble())
+                nearExitNode.value = if (dist < 3.0) closestExit else null
+            } else {
+                nearExitNode.value = null
+            }
+        } else {
+            nearExitNode.value = null
+        }
 
         val route = _activeRoute.value
         if (route.isNotEmpty()) {
@@ -1113,4 +1449,6 @@ class MapViewModel(
             )
         }
     }
+
+    suspend fun getAllBuildings(): List<BuildingEntity> = mapDao.getAllBuildings()
 }
