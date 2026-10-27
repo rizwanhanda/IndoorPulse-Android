@@ -42,7 +42,17 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import android.content.ContentValues
+import android.content.Context
 import android.location.Location
+import android.net.Uri
+import android.os.Environment
+import android.provider.MediaStore
+import org.json.JSONArray
+import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.UUID
 import kotlin.math.abs
 import kotlin.math.cos
@@ -1574,4 +1584,191 @@ class MapViewModel(
     }
 
     suspend fun getAllBuildings(): List<BuildingEntity> = mapDao.getAllBuildings()
+
+    fun exportMapToJson(context: Context) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val buildingId = _activeBuildingId.value ?: return@launch
+                val exportNodes = mapDao.getNodesByBuilding(buildingId)
+                val exportEdges = mapDao.getEdgesByBuilding(buildingId)
+                val building = mapDao.getBuildingById(buildingId)
+                val safeName = building?.name?.replace(Regex("[^a-zA-Z0-9]"), "_") ?: "Map"
+                val timeStr = SimpleDateFormat("yyyyMMdd_HHmm", Locale.getDefault()).format(Date())
+
+                val root = JSONObject().apply {
+                    put("version", "1.0")
+                    put("building_id", buildingId)
+                    if (building != null) {
+                        put("building_name", building.name)
+                        put("centerLat", building.centerLat)
+                        put("centerLng", building.centerLng)
+                        put("geofenceRadius", building.geofenceRadius.toDouble())
+                    }
+                    put("timestamp", System.currentTimeMillis())
+                }
+
+                val nodesArray = JSONArray()
+                exportNodes.forEach { node ->
+                    val nodeObj = JSONObject().apply {
+                        put("nodeId", node.nodeId)
+                        put("x", node.x.toDouble())
+                        put("y", node.y.toDouble())
+                        put("floorLevel", node.floorLevel)
+                        put("type", node.nodeType)
+                        put("label", node.label)
+                        put("floorId", node.floorId)
+                        put("lat", node.lat)
+                        put("lng", node.lng)
+                    }
+                    nodesArray.put(nodeObj)
+                }
+                root.put("nodes", nodesArray)
+
+                val edgesArray = JSONArray()
+                exportEdges.forEach { edge ->
+                    val edgeObj = JSONObject().apply {
+                        put("edgeId", edge.edgeId)
+                        put("fromNodeId", edge.fromNodeId)
+                        put("toNodeId", edge.toNodeId)
+                        put("lengthMeters", edge.lengthMeters.toDouble())
+                        put("edgeType", edge.edgeType)
+                    }
+                    edgesArray.put(edgeObj)
+                }
+                root.put("edges", edgesArray)
+
+                val contentValues = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, "${safeName}_v1.0_${timeStr}.json")
+                    put(MediaStore.MediaColumns.MIME_TYPE, "application/json")
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                }
+
+                val uri = context.contentResolver.insert(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    contentValues
+                )
+
+                if (uri != null) {
+                    context.contentResolver.openOutputStream(uri)?.use { outputStream ->
+                        outputStream.write(root.toString(4).toByteArray(Charsets.UTF_8))
+                    }
+                    _uiState.update { it.copy(statusMessage = "Map exported to Downloads!") }
+                    _routeError.tryEmit("Exported $safeName to Downloads!")
+                } else {
+                    _uiState.update { it.copy(statusMessage = "Failed to export: URI creation failed") }
+                    _routeError.tryEmit("Failed to export: URI creation failed")
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(statusMessage = "Export failed: ${e.message}") }
+                _routeError.tryEmit("Export failed: ${e.message}")
+            }
+        }
+    }
+
+    fun importMapFromJson(context: Context, uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val jsonString = context.contentResolver.openInputStream(uri)?.use { inputStream ->
+                    inputStream.bufferedReader().use { it.readText() }
+                } ?: throw IllegalStateException("Failed to open input stream for URI: $uri")
+
+                val root = JSONObject(jsonString)
+                val newBuildingId = UUID.randomUUID().toString()
+
+                val timestamp = root.optLong("timestamp", System.currentTimeMillis())
+                val dateStr = SimpleDateFormat("MMM dd, HH:mm", Locale.getDefault()).format(Date(timestamp))
+                val buildingName = root.optString("building_name").ifBlank { "Imported Building" }
+                val finalBuildingName = "$buildingName [Import $dateStr]"
+
+                val centerLat = root.optDouble("centerLat", 0.0)
+                val centerLng = root.optDouble("centerLng", 0.0)
+                val geofenceRadius = root.optDouble("geofenceRadius", 150.0).toFloat()
+                val newBuilding = BuildingEntity(
+                    buildingId = newBuildingId,
+                    name = finalBuildingName,
+                    centerLat = centerLat,
+                    centerLng = centerLng,
+                    geofenceRadius = geofenceRadius
+                )
+                mapDao.insertBuildings(listOf(newBuilding))
+
+                val nodeIdMap = mutableMapOf<String, String>()
+                val newNodes = mutableListOf<NodeEntity>()
+
+                val nodesArray = root.optJSONArray("nodes")
+                if (nodesArray != null) {
+                    for (i in 0 until nodesArray.length()) {
+                        val nodeObj = nodesArray.optJSONObject(i) ?: continue
+                        val oldId = nodeObj.optString("nodeId").ifBlank { nodeObj.optString("id") }
+                        val newId = UUID.randomUUID().toString()
+                        if (oldId.isNotBlank()) {
+                            nodeIdMap[oldId] = newId
+                        }
+                        val x = nodeObj.optDouble("x", 0.0).toFloat()
+                        val y = nodeObj.optDouble("y", 0.0).toFloat()
+                        val floorLevel = nodeObj.optInt("floorLevel", 0)
+                        val type = nodeObj.optString("type").ifBlank { nodeObj.optString("nodeType", "Hallway") }
+                        val label = nodeObj.optString("label").ifBlank { nodeObj.optString("name", "") }
+                        val floorId = nodeObj.optString("floorId").ifBlank { "f1" }
+                        val lat = nodeObj.optDouble("lat", 0.0)
+                        val lng = nodeObj.optDouble("lng", 0.0)
+
+                        val node = NodeEntity(
+                            nodeId = newId,
+                            floorId = floorId,
+                            x = x,
+                            y = y,
+                            nodeType = type,
+                            name = label,
+                            floorLevel = floorLevel,
+                            buildingId = newBuildingId,
+                            lat = lat,
+                            lng = lng
+                        )
+                        newNodes.add(node)
+                    }
+                }
+
+                val newEdges = mutableListOf<EdgeEntity>()
+                val edgesArray = root.optJSONArray("edges")
+                if (edgesArray != null) {
+                    for (i in 0 until edgesArray.length()) {
+                        val edgeObj = edgesArray.optJSONObject(i) ?: continue
+                        val oldFrom = edgeObj.optString("fromNodeId").ifBlank { edgeObj.optString("startNodeId") }
+                        val oldTo = edgeObj.optString("toNodeId").ifBlank { edgeObj.optString("endNodeId") }
+                        val mappedFrom = nodeIdMap[oldFrom]
+                        val mappedTo = nodeIdMap[oldTo]
+                        if (mappedFrom != null && mappedTo != null) {
+                            val lengthMeters = edgeObj.optDouble("lengthMeters", edgeObj.optDouble("weight", 0.0)).toFloat()
+                            val edgeType = edgeObj.optString("edgeType").ifBlank { "hallway" }
+                            val edge = EdgeEntity(
+                                edgeId = UUID.randomUUID().toString(),
+                                fromNodeId = mappedFrom,
+                                toNodeId = mappedTo,
+                                lengthMeters = lengthMeters,
+                                edgeType = edgeType,
+                                buildingId = newBuildingId
+                            )
+                            newEdges.add(edge)
+                        }
+                    }
+                }
+
+                mapDao.insertNodes(newNodes)
+                mapDao.insertEdges(newEdges)
+
+                _activeBuildingId.value = newBuildingId
+                refreshCache(newBuildingId)
+                if (newNodes.isNotEmpty()) {
+                    _currentFloor.value = newNodes.first().floorLevel
+                }
+
+                _uiState.update { it.copy(statusMessage = "Map imported successfully!") }
+                _routeError.tryEmit("Successfully imported $finalBuildingName!")
+            } catch (e: Exception) {
+                _uiState.update { it.copy(statusMessage = "Import failed: ${e.message}") }
+                _routeError.tryEmit("Import failed: ${e.message}")
+            }
+        }
+    }
 }

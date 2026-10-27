@@ -63,12 +63,21 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.filled.Save
+import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.ui.window.Dialog
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(viewModel: MapViewModel) {
     val context = LocalContext.current
+    val jsonPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri ->
+        uri?.let { viewModel.importMapFromJson(context, it) }
+    }
     LaunchedEffect(Unit) {
         viewModel.routeError.collect { errorMessage ->
             Toast.makeText(context, errorMessage, Toast.LENGTH_LONG).show()
@@ -287,6 +296,25 @@ fun MainScreen(viewModel: MapViewModel) {
                         scope.launch { drawerState.close() }
                     },
                     badge = { Switch(checked = isSurveyorMode, onCheckedChange = null) }
+                )
+                HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                NavigationDrawerItem(
+                    label = { Text("Export Map Backup") },
+                    icon = { Icon(Icons.Default.Save, contentDescription = "Export") },
+                    selected = false,
+                    onClick = {
+                        viewModel.exportMapToJson(context)
+                        scope.launch { drawerState.close() }
+                    }
+                )
+                NavigationDrawerItem(
+                    label = { Text("Import Map Backup") },
+                    icon = { Icon(Icons.Default.UploadFile, contentDescription = "Import") },
+                    selected = false,
+                    onClick = {
+                        jsonPickerLauncher.launch("application/json")
+                        scope.launch { drawerState.close() }
+                    }
                 )
             }
         }
@@ -775,16 +803,37 @@ fun ManualOverrideDialog(
                                     },
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .height(48.dp),
-                                    shape = RoundedCornerShape(12.dp)
+                                        .padding(vertical = 4.dp)
+                                        .heightIn(min = 64.dp), // Dynamic height allowing expansion
+                                    shape = RoundedCornerShape(12.dp),
+                                    contentPadding = PaddingValues(16.dp)
                                 ) {
-                                    Row(
+                                    Column(
                                         modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
+                                        horizontalAlignment = Alignment.Start
                                     ) {
-                                        Text(building.name, fontWeight = FontWeight.SemiBold)
-                                        Text("${building.geofenceRadius.toInt()}m", style = MaterialTheme.typography.labelSmall)
+                                        Text(
+                                            text = building.name,
+                                            style = MaterialTheme.typography.titleMedium,
+                                            color = Color.White
+                                            // Explicitly omitting maxLines so it wraps naturally
+                                        )
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween
+                                        ) {
+                                            Text(
+                                                text = "Radius: ${building.geofenceRadius.toInt()}m",
+                                                style = MaterialTheme.typography.labelMedium,
+                                                color = Color.Gray
+                                            )
+                                            Text(
+                                                text = "ID: ${building.buildingId.take(6)}",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = Color.DarkGray
+                                            )
+                                        }
                                     }
                                 }
                             }
