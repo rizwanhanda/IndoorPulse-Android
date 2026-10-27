@@ -22,6 +22,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.material.icons.filled.Elevator
 import androidx.compose.material.icons.filled.Stairs
+import androidx.compose.material.icons.filled.Accessible
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.LocationCity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -322,6 +324,18 @@ fun MainScreen(viewModel: MapViewModel) {
                         }
                     },
                     actions = {
+                        val isAccessible by viewModel.accessibleMode.collectAsState()
+                        IconButton(
+                            onClick = { viewModel.toggleAccessibleMode() },
+                            modifier = Modifier
+                                .padding(end = 12.dp)
+                                .background(
+                                    color = if (isAccessible) Color(0xFF00C853) else Color(0x33FFFFFF),
+                                    shape = RoundedCornerShape(12.dp)
+                                )
+                        ) {
+                            Icon(Icons.Default.Accessible, contentDescription = "Accessible", tint = Color.White)
+                        }
                         if (trackingState == TrackingState.OUTDOORS) {
                             IconButton(onClick = { showManualOverrideDialog = true }) {
                                 Icon(
@@ -342,9 +356,9 @@ fun MainScreen(viewModel: MapViewModel) {
                         }
                     },
                     colors = TopAppBarDefaults.topAppBarColors(
-                        // DYNAMIC SOS COLOR SHIFT
-                        containerColor = if (isSosActive) Color.Red else MaterialTheme.colorScheme.primary,
-                        titleContentColor = Color.White
+                        containerColor = Color(0xFF1A1A2E),
+                        titleContentColor = Color.White,
+                        actionIconContentColor = Color.White
                     )
                 )
             }
@@ -470,12 +484,13 @@ fun MainScreen(viewModel: MapViewModel) {
                     }
                 }
 
-                // Replace the old Floor FAB with this Custom Selector
+                // RIGHT-SIDE FLOATING CONTROLS (Floor Selector, 3D Button, Recenter Button)
                 Column(
                     modifier = Modifier
-                        .align(Alignment.CenterEnd)
-                        .padding(end = 16.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                        .align(Alignment.BottomEnd)
+                        .padding(bottom = if (isSurveyorMode) 180.dp else 24.dp, end = 16.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     // Filter out floors if standard user, or allow extended range for surveyor
                     val displayFloors = if (isSurveyorMode) {
@@ -509,16 +524,7 @@ fun MainScreen(viewModel: MapViewModel) {
                             }
                         }
                     }
-                }
 
-                // RIGHT-SIDE FAB STACK (3D CAD Toggle, Recenter)
-                Column(
-                    modifier = Modifier
-                        .align(Alignment.BottomEnd)
-                        // CRITICAL FIX: Increased Surveyor Mode padding from 140.dp to 170.dp to prevent overlap
-                        .padding(end = 16.dp, bottom = if (isSurveyorMode) 170.dp else 100.dp),
-                    verticalArrangement = Arrangement.spacedBy(16.dp)
-                ) {
                     // 3D CAD Toggle
                     FloatingActionButton(onClick = { viewModel.toggle3DMode() }) { 
                         Icon(if (is3DMode) Icons.Default.ViewInAr else Icons.Default.Map, contentDescription = "Toggle 3D") 
@@ -594,8 +600,9 @@ fun MainScreen(viewModel: MapViewModel) {
     if (nearExitNode != null) {
         ExitBuildingDialog(
             nearExitNode = nearExitNode!!,
+            viewModel = viewModel,
             onConfirmExit = { viewModel.confirmBuildingExit() },
-            onDismiss = { viewModel.nearExitNode.value = null }
+            onDismiss = { viewModel.resetExitDebounce() }
         )
     }
 
@@ -618,8 +625,9 @@ fun MainScreen(viewModel: MapViewModel) {
 @Composable
 fun ExitBuildingDialog(
     nearExitNode: NodeEntity,
+    viewModel: MapViewModel,
     onConfirmExit: () -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit = { viewModel.resetExitDebounce() }
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -645,7 +653,7 @@ fun ExitBuildingDialog(
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
+            TextButton(onClick = { viewModel.resetExitDebounce() }) {
                 Text("Stay Indoors")
             }
         }
@@ -894,7 +902,7 @@ fun SurveyorHUD(
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             // ROW 1: Scrollable Node Types
-            val types = listOf("Waypoint", "Junction", "Room Door", "Washroom", "Stairs", "Emergency Exit", "Building Entry")
+            val types = listOf("Waypoint", "Junction", "Room Door", "Washroom", "Stairs", "Elevator", "Emergency Exit", "Building Entry")
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -907,6 +915,17 @@ fun SurveyorHUD(
                         onClick = { onNodeTypeSelected(type) },
                         label = { Text(type, style = MaterialTheme.typography.labelSmall) }
                     )
+                }
+            }
+
+            if (isPortal) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    OutlinedButton(onClick = { viewModel.extrudePortal(1) }) { Text("Push Up (L+1)") }
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedButton(onClick = { viewModel.extrudePortal(-1) }) { Text("Push Down (L-1)") }
                 }
             }
 
@@ -946,17 +965,6 @@ fun SurveyorHUD(
                             contentDescription = "Edit Selected",
                             tint = if (selectedNode != null) MaterialTheme.colorScheme.primary else Color.Gray
                         )
-                    }
-                    
-                    if (isPortal) {
-                        OutlinedButton(
-                            onClick = { viewModel.extrudePortal(1) },
-                            contentPadding = PaddingValues(horizontal = 8.dp)
-                        ) { Text("L+1", style = MaterialTheme.typography.labelSmall) }
-                        OutlinedButton(
-                            onClick = { viewModel.extrudePortal(-1) },
-                            contentPadding = PaddingValues(horizontal = 8.dp)
-                        ) { Text("L-1", style = MaterialTheme.typography.labelSmall) }
                     }
                 }
 
@@ -1150,10 +1158,12 @@ fun NodeEditDialog(
 
                 HorizontalDivider()
 
-                // Actions: Delete Node (Red OutlinedButton) & Close
+                // Actions: Delete Node (Red OutlinedButton), Resume Path & Close
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     OutlinedButton(
@@ -1168,6 +1178,12 @@ fun NodeEditDialog(
                         Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(4.dp))
                         Text("Delete Node")
+                    }
+
+                    OutlinedButton(onClick = { viewModel.resumePathFromNode(node); onDismiss() }) {
+                        Icon(Icons.Default.PlayArrow, contentDescription = null)
+                        Spacer(Modifier.width(4.dp))
+                        Text("Resume Path Here")
                     }
 
                     TextButton(onClick = onDismiss) {

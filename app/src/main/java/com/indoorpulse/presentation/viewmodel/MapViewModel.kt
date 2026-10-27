@@ -105,6 +105,12 @@ class MapViewModel(
         _selectedNode.value = node
     }
 
+    fun resumePathFromNode(node: NodeEntity) {
+        lastDroppedNodeId.value = node.nodeId
+        snapTargetNodeId.value = null
+        _uiState.update { it.copy(statusMessage = "Resumed path from ${node.label}") }
+    }
+
     private val _currentFloor = MutableStateFlow(0)
     val currentFloor: StateFlow<Int> = _currentFloor.asStateFlow()
 
@@ -130,6 +136,20 @@ class MapViewModel(
     private val _isSosActive = MutableStateFlow(false)
     val isSosActive: StateFlow<Boolean> = _isSosActive.asStateFlow()
     val activeDestination = MutableStateFlow<NodeEntity?>(null)
+
+    private val _accessibleMode = MutableStateFlow(false)
+    val accessibleMode: StateFlow<Boolean> = _accessibleMode.asStateFlow()
+
+    fun toggleAccessibleMode() {
+        _accessibleMode.value = !_accessibleMode.value
+        val modeStr = if (_accessibleMode.value) "ON (Avoiding Stairs)" else "OFF"
+        _uiState.update { it.copy(statusMessage = "Accessible Mode: $modeStr") }
+        activeDestination.value?.let { calculateRoute(it) } 
+    }
+
+    fun calculateRoute(destinationNode: NodeEntity) {
+        requestRoute(destinationNode.nodeId)
+    }
     
     private val _nodes = MutableStateFlow<List<NodeEntity>>(emptyList())
     private val _undoStack = MutableStateFlow<List<SurveyorAction>>(emptyList())
@@ -519,30 +539,6 @@ class MapViewModel(
             estimatedPosition.value = pos
             onLocationUpdated(pos.first, pos.second)
             
-            if (isSurveyorMode.value) {
-                val lastId = lastDroppedNodeId.value
-                val lastNode = lastId?.let { cachedNodes[it] }
-                val closestSnappable = cachedNodes.values
-                    .filter { isSnappableCandidate(it, lastNode) }
-                    .minByOrNull { node ->
-                        val dX = node.x - pos.first
-                        val dY = node.y - pos.second
-                        (dX * dX) + (dY * dY)
-                    }
-                val snapDist = if (closestSnappable != null) {
-                    val dX = closestSnappable.x - pos.first
-                    val dY = closestSnappable.y - pos.second
-                    kotlin.math.sqrt((dX * dX + dY * dY).toDouble()).toFloat()
-                } else Float.MAX_VALUE
-                
-                if (closestSnappable != null && snapDist <= 3.5f) {
-                    snapTargetNodeId.value = closestSnappable.nodeId
-                } else {
-                    snapTargetNodeId.value = null
-                }
-            } else {
-                snapTargetNodeId.value = null
-            }
 
             updateActiveRouteBasedOnPosition()
 
@@ -583,6 +579,11 @@ class MapViewModel(
         entryAnchorNode = null
         trackingState.value = TrackingState.OUTDOORS
         _uiState.update { it.copy(statusMessage = "Exited building. Switched to OUTDOORS.") }
+    }
+
+    fun resetExitDebounce() {
+        lastEntryTimeMillis = System.currentTimeMillis()
+        nearExitNode.value = null
     }
 
     fun manualOverride(buildingId: String, entryNode: NodeEntity) {
@@ -646,8 +647,12 @@ class MapViewModel(
     fun canLinkNodes(nodeA: NodeEntity, nodeB: NodeEntity): Boolean {
         // 1. Cross-Floor Validation
         if (nodeA.floorLevel != nodeB.floorLevel) {
-            val isNodeAValid = nodeA.type in validPortals || validPortals.any { it.equals(nodeA.type, ignoreCase = true) }
-            val isNodeBValid = nodeB.type in validPortals || validPortals.any { it.equals(nodeB.type, ignoreCase = true) }
+            val isNodeAValid = nodeA.nodeType.equals("Stairs", ignoreCase = true) || 
+                               nodeA.nodeType.equals("Elevator", ignoreCase = true) ||
+                               nodeA.nodeType.equals("Emergency Exit", ignoreCase = true)
+            val isNodeBValid = nodeB.nodeType.equals("Stairs", ignoreCase = true) || 
+                               nodeB.nodeType.equals("Elevator", ignoreCase = true) ||
+                               nodeB.nodeType.equals("Emergency Exit", ignoreCase = true)
             if (!isNodeAValid || !isNodeBValid) {
                 // Reject the edge: You cannot connect standard nodes across floors
                 return false
@@ -664,7 +669,7 @@ class MapViewModel(
         val dy = nodeB.y - nodeA.y
         val length = kotlin.math.sqrt((dx * dx + dy * dy).toDouble()).toFloat().coerceAtLeast(0.1f)
         val edgeType = if (nodeA.floorLevel != nodeB.floorLevel) {
-            if (nodeA.type.equals("Elevator", ignoreCase = true) && nodeB.type.equals("Elevator", ignoreCase = true)) {
+            if (nodeA.nodeType.equals("Elevator", ignoreCase = true) || nodeB.nodeType.equals("Elevator", ignoreCase = true)) {
                 "elevator"
             } else {
                 "stairs"
@@ -686,8 +691,13 @@ class MapViewModel(
     fun linkNodes(nodeA: NodeEntity, nodeB: NodeEntity): EdgeEntity? {
         // 1. Cross-Floor Validation
         if (nodeA.floorLevel != nodeB.floorLevel) {
-            val validPortals = listOf("Stairs", "Elevator", "Emergency Exit")
-            if (nodeA.type !in validPortals || nodeB.type !in validPortals) {
+            val isNodeAValid = nodeA.nodeType.equals("Stairs", ignoreCase = true) || 
+                               nodeA.nodeType.equals("Elevator", ignoreCase = true) ||
+                               nodeA.nodeType.equals("Emergency Exit", ignoreCase = true)
+            val isNodeBValid = nodeB.nodeType.equals("Stairs", ignoreCase = true) || 
+                               nodeB.nodeType.equals("Elevator", ignoreCase = true) ||
+                               nodeB.nodeType.equals("Emergency Exit", ignoreCase = true)
+            if (!isNodeAValid || !isNodeBValid) {
                 // Reject the edge: You cannot connect standard nodes across floors
                 return null
             }
@@ -816,7 +826,9 @@ class MapViewModel(
         }
 
         viewModelScope.launch {
-            val targetFloorLevel = _currentFloor.value + direction
+            val sourceNode = selected
+            val targetFloor = _currentFloor.value + direction
+            val targetFloorLevel = targetFloor
             val targetFloorId = "f$targetFloorLevel"
             val newNodeId = java.util.UUID.randomUUID().toString()
 
@@ -831,27 +843,29 @@ class MapViewModel(
                 )
             )
 
+            val cleanName = sourceNode.label.replace(Regex(" \\(L[-0-9]+\\)$"), "")
+            val label = "$cleanName (L$targetFloor)"
             val newNode = NodeEntity(
                 nodeId = newNodeId,
                 floorId = targetFloorId,
-                x = selected.x,
-                y = selected.y,
-                nodeType = selected.nodeType,
-                name = selected.name,
+                x = sourceNode.x,
+                y = sourceNode.y,
+                nodeType = sourceNode.nodeType,
+                name = label,
                 floorLevel = targetFloorLevel,
-                buildingId = selected.buildingId,
-                lat = selected.lat,
-                lng = selected.lng
+                buildingId = sourceNode.buildingId,
+                lat = sourceNode.lat,
+                lng = sourceNode.lng
             )
             mapDao.insertNodes(listOf(newNode))
 
             val newEdge = EdgeEntity(
                 edgeId = java.util.UUID.randomUUID().toString(),
-                fromNodeId = selected.nodeId,
+                fromNodeId = sourceNode.nodeId,
                 toNodeId = newNodeId,
-                lengthMeters = 0f,
+                lengthMeters = 30.0f,
                 edgeType = "vertical_portal",
-                buildingId = selected.buildingId
+                buildingId = sourceNode.buildingId
             )
             mapDao.insertEdges(listOf(newEdge))
             _undoStack.value = _undoStack.value + SurveyorAction.DropNode(newNode, newEdge)
@@ -864,11 +878,15 @@ class MapViewModel(
     }
 
     fun snapToGhostPortal(currentNode: NodeEntity, targetGhostNode: NodeEntity) {
-        val validPortals = listOf("Stairs", "Elevator", "Emergency Exit")
+        val isCurrentPortal = currentNode.nodeType.equals("Stairs", ignoreCase = true) || 
+                              currentNode.nodeType.equals("Elevator", ignoreCase = true) ||
+                              currentNode.nodeType.equals("Emergency Exit", ignoreCase = true)
+        val isTargetPortal = targetGhostNode.nodeType.equals("Stairs", ignoreCase = true) || 
+                             targetGhostNode.nodeType.equals("Elevator", ignoreCase = true) ||
+                             targetGhostNode.nodeType.equals("Emergency Exit", ignoreCase = true)
         
         // Ensure both are valid portals and on adjacent floors
-        if ((currentNode.type in validPortals || validPortals.any { it.equals(currentNode.type, ignoreCase = true) }) &&
-            (targetGhostNode.type in validPortals || validPortals.any { it.equals(targetGhostNode.type, ignoreCase = true) })) {
+        if (isCurrentPortal && isTargetPortal) {
             if (kotlin.math.abs(currentNode.floorLevel - targetGhostNode.floorLevel) == 1) {
                 
                 // 1. Align the X/Y coordinates perfectly
@@ -901,9 +919,12 @@ class MapViewModel(
                     val targetNode = cachedNodes[targetId]
                     
                     if (lastNode != null && targetNode != null) {
-                        val validPortals = listOf("Stairs", "Elevator", "Emergency Exit")
-                        val isLastPortal = lastNode.type in validPortals || validPortals.any { it.equals(lastNode.type, ignoreCase = true) }
-                        val isTargetPortal = targetNode.type in validPortals || validPortals.any { it.equals(targetNode.type, ignoreCase = true) }
+                        val isLastPortal = lastNode.nodeType.equals("Stairs", ignoreCase = true) || 
+                                           lastNode.nodeType.equals("Elevator", ignoreCase = true) ||
+                                           lastNode.nodeType.equals("Emergency Exit", ignoreCase = true)
+                        val isTargetPortal = targetNode.nodeType.equals("Stairs", ignoreCase = true) || 
+                                             targetNode.nodeType.equals("Elevator", ignoreCase = true) ||
+                                             targetNode.nodeType.equals("Emergency Exit", ignoreCase = true)
 
                         if (isLastPortal && isTargetPortal && kotlin.math.abs(lastNode.floorLevel - targetNode.floorLevel) == 1) {
                             // 1. Align the X/Y coordinates perfectly
@@ -948,57 +969,58 @@ class MapViewModel(
     }
 
     fun snapToNearestNode() {
-        val lastId = lastDroppedNodeId.value ?: _selectedNode.value?.nodeId
-        if (lastId == null) {
-            _uiState.update { it.copy(statusMessage = "Snap failed: Drop or select a node first.") }
+        val originId = lastDroppedNodeId.value
+        if (originId == null) {
+            _uiState.update { it.copy(statusMessage = "No active origin. Use 'Resume Path' on a node first.") }
             return
         }
 
-        val (curX, curY) = estimatedPosition.value
-        val floor = _currentFloor.value
-
-        val candidates = cachedNodes.values.filter {
-            it.floorLevel == floor && it.nodeId != lastId
-        }
-
-        val nearestNode = candidates.minByOrNull {
-            Math.hypot((it.x - curX).toDouble(), (it.y - curY).toDouble())
-        }
-
-        if (nearestNode == null) {
-            _uiState.update { it.copy(statusMessage = "Snap failed: No nodes on floor L$floor.") }
+        val targetId = _selectedNode.value?.nodeId ?: snapTargetNodeId.value
+        if (targetId == null) {
+            _uiState.update { it.copy(statusMessage = "No node selected or in range to snap.") }
             return
         }
 
-        val dist = Math.hypot((nearestNode.x - curX).toDouble(), (nearestNode.y - curY).toDouble())
-        if (dist > 10.0) {
-            _uiState.update { it.copy(statusMessage = "Snap failed: Nearest node is too far (%.1fm).".format(dist)) }
+        if (originId == targetId) {
+            _uiState.update { it.copy(statusMessage = "Cannot link node to itself.") }
             return
         }
 
-        val lastNode = cachedNodes[lastId] ?: return
+        val originNode = cachedNodes[originId] ?: return
+        val targetNode = cachedNodes[targetId] ?: return
 
-        val dx = nearestNode.x - lastNode.x
-        val dy = nearestNode.y - lastNode.y
-        val weight = Math.hypot(dx.toDouble(), dy.toDouble()).toFloat().coerceAtLeast(0.1f)
+        val dx = targetNode.x - originNode.x
+        val dy = targetNode.y - originNode.y
+        val distance = Math.hypot(dx.toDouble(), dy.toDouble()).toFloat().coerceAtLeast(0.1f)
+        val edgeType = if (originNode.floorLevel != targetNode.floorLevel) {
+            if (originNode.nodeType.equals("Elevator", ignoreCase = true) || targetNode.nodeType.equals("Elevator", ignoreCase = true)) {
+                "elevator"
+            } else {
+                "stairs"
+            }
+        } else {
+            "corridor"
+        }
 
         val newEdge = EdgeEntity(
             edgeId = java.util.UUID.randomUUID().toString(),
-            fromNodeId = lastNode.nodeId,
-            toNodeId = nearestNode.nodeId,
-            lengthMeters = weight,
-            edgeType = "corridor",
-            buildingId = lastNode.buildingId
+            fromNodeId = originNode.nodeId,
+            toNodeId = targetNode.nodeId,
+            lengthMeters = distance,
+            edgeType = edgeType,
+            buildingId = originNode.buildingId
         )
 
         viewModelScope.launch(Dispatchers.IO) {
             mapDao.insertEdges(listOf(newEdge))
             _undoStack.value = _undoStack.value + SurveyorAction.SnapEdge(newEdge)
             _redoStack.value = emptyList()
-            lastDroppedNodeId.value = nearestNode.nodeId
-            _selectedNode.value = nearestNode
+            droppedNodesChain.add(targetNode.nodeId)
+            lastDroppedNodeId.value = targetNode.nodeId
+            _selectedNode.value = null // Crucial Cleanup: clear manual override state
             refreshCache(_activeBuildingId.value ?: "default_building")
-            _uiState.update { it.copy(statusMessage = "Snapped to ${nearestNode.label}") }
+            updateProximitySnapTarget(estimatedPosition.value.first, estimatedPosition.value.second)
+            _uiState.update { it.copy(statusMessage = "Snapped to ${targetNode.label}") }
         }
     }
 
@@ -1126,8 +1148,32 @@ class MapViewModel(
         )
     }
 
+    private fun updateProximitySnapTarget(posX: Float, posY: Float) {
+        if (!isSurveyorMode.value) {
+            snapTargetNodeId.value = null
+            return
+        }
+        val ignoreId = lastDroppedNodeId.value
+        val candidates = cachedNodes.values.filter { it.nodeId != ignoreId }
+        val closestNode = candidates.minByOrNull { node ->
+            Math.hypot((node.x - posX).toDouble(), (node.y - posY).toDouble())
+        }
+        if (closestNode != null) {
+            val dist = Math.hypot((closestNode.x - posX).toDouble(), (closestNode.y - posY).toDouble())
+            if (dist <= 5.0) {
+                snapTargetNodeId.value = closestNode.nodeId
+            } else {
+                snapTargetNodeId.value = null
+            }
+        } else {
+            snapTargetNodeId.value = null
+        }
+    }
+
     fun onLocationUpdated(newX: Float, newY: Float) {
         if (_transitState.value != null) return // CRITICAL: Pause PDR during transit
+
+        updateProximitySnapTarget(newX, newY)
 
         // Exit proximity detection when INDOORS
         if (trackingState.value == TrackingState.INDOORS) {
@@ -1159,13 +1205,30 @@ class MapViewModel(
                 // 2. Is this a floor transition?
                 if (route.size > 1 && route[1].floorLevel != _currentFloor.value) {
                     val targetPortal = route[1]
+                    var finalPortalIndex = 1
+                    // Look ahead to skip intermediate floors in the same elevator/stair shaft
+                    while (finalPortalIndex + 1 < route.size && 
+                           route[finalPortalIndex + 1].type == targetPortal.type && 
+                           route[finalPortalIndex + 1].x == targetPortal.x && 
+                           route[finalPortalIndex + 1].y == targetPortal.y) {
+                        finalPortalIndex++
+                    }
+                    val finalPortal = route[finalPortalIndex]
+
+                    val portalType = if (finalPortal.type.equals("Elevator", ignoreCase = true) || nextWaypoint.type.equals("Elevator", ignoreCase = true)) {
+                        "Elevator"
+                    } else if (finalPortal.type.equals("Stairs", ignoreCase = true) || nextWaypoint.type.equals("Stairs", ignoreCase = true)) {
+                        "Stairs"
+                    } else {
+                        finalPortal.type
+                    }
                     // Trigger Transit UX
                     _transitState.value = TransitInfo(
-                        targetFloor = targetPortal.floorLevel,
-                        portalType = targetPortal.type,
-                        targetX = targetPortal.x,
-                        targetY = targetPortal.y,
-                        nextNodeIndex = 1 
+                        targetFloor = finalPortal.floorLevel,
+                        portalType = portalType,
+                        targetX = finalPortal.x,
+                        targetY = finalPortal.y,
+                        nextNodeIndex = finalPortalIndex 
                     )
                 } else {
                     // Normal waypoint reached, pop it off the route so UI points to the next one
@@ -1191,6 +1254,78 @@ class MapViewModel(
         _transitState.value = null
     }
 
+    fun findShortestPath(startId: String, targetId: String): List<NodeEntity>? {
+        val nodesMap = cachedNodes
+        if (!nodesMap.containsKey(startId) || !nodesMap.containsKey(targetId)) return null
+
+        val adj = mutableMapOf<String, MutableList<EdgeEntity>>()
+        cachedEdges.forEach { edge ->
+            adj.getOrPut(edge.fromNodeId) { mutableListOf() }.add(edge)
+            adj.getOrPut(edge.toNodeId) { mutableListOf() }.add(
+                EdgeEntity(edge.edgeId, edge.toNodeId, edge.fromNodeId, edge.lengthMeters, edge.edgeType, edge.buildingId)
+            )
+        }
+
+        fun heuristic(n1Id: String, n2Id: String): Float {
+            val n1 = nodesMap[n1Id] ?: return Float.MAX_VALUE
+            val n2 = nodesMap[n2Id] ?: return Float.MAX_VALUE
+            val dx = n1.x - n2.x
+            val dy = n1.y - n2.y
+            val dz = (n1.floorLevel - n2.floorLevel) * 10f
+            return Math.sqrt((dx * dx + dy * dy + dz * dz).toDouble()).toFloat()
+        }
+
+        val openSet = java.util.PriorityQueue<Pair<String, Float>>(compareBy { it.second })
+        val cameFrom = mutableMapOf<String, String>()
+        val gScore = mutableMapOf<String, Float>().withDefault { Float.MAX_VALUE }
+
+        gScore[startId] = 0f
+        openSet.add(startId to heuristic(startId, targetId))
+
+        while (openSet.isNotEmpty()) {
+            val current = openSet.poll()?.first ?: break
+
+            if (current == targetId) {
+                val path = mutableListOf<NodeEntity>()
+                var curr = current
+                while (cameFrom.containsKey(curr)) {
+                    path.add(0, nodesMap[curr]!!)
+                    curr = cameFrom[curr]!!
+                }
+                path.add(0, nodesMap[startId]!!)
+                return path
+            }
+
+            for (edge in adj[current] ?: emptyList()) {
+                val neighbor = edge.toNodeId
+                val neighborNode = nodesMap[neighbor] ?: continue
+
+                // HARD BLOCK: Stairs are impassable in accessible mode
+                if (_accessibleMode.value && neighborNode.nodeType.equals("Stairs", ignoreCase = true)) {
+                    continue 
+                }
+
+                var physicalDistance = if (edge.lengthMeters == 0f) 0f else heuristic(current, neighbor)
+
+                // INJECT TIE-BREAKER:
+                if (!_accessibleMode.value && neighborNode.nodeType.equals("Elevator", ignoreCase = true)) {
+                    physicalDistance += 20.0f // Mild penalty to prioritize stairs for able-bodied users
+                }
+
+                val tentativeGScore = gScore.getValue(current) + physicalDistance
+
+                if (tentativeGScore < gScore.getValue(neighbor)) {
+                    cameFrom[neighbor] = current
+                    gScore[neighbor] = tentativeGScore
+                    val fScore = tentativeGScore + heuristic(neighbor, targetId)
+                    openSet.removeAll { it.first == neighbor }
+                    openSet.add(neighbor to fScore)
+                }
+            }
+        }
+        return null
+    }
+
     private fun updateActiveRouteBasedOnPosition() {
         if (_transitState.value != null) return
         val destId = _uiState.value.selectedDestinationNodeId ?: return
@@ -1205,9 +1340,9 @@ class MapViewModel(
             }
         
         if (closestNode != null) {
-            val pathNodes = routingEngine.findShortestPath(closestNode.nodeId, destId)
+            val pathNodes = findShortestPath(closestNode.nodeId, destId)
             if (!pathNodes.isNullOrEmpty()) {
-                val route = pathNodes.map { Coordinate(it.x, it.y, floor = it.floorLevel) }
+                val route = pathNodes.map { Coordinate(it.x, it.y, floor = it.floorLevel, type = it.type) }
                 _activeRoute.value = route
                 _uiState.update { it.copy(activeRoute = route) }
             }
@@ -1239,21 +1374,30 @@ class MapViewModel(
             val destinationNode = cachedNodes[destinationId] ?: allNodes.find { it.nodeId == destinationId }
             activeDestination.value = destinationNode
 
-            val pathNodes = routingEngine.findShortestPath(startNodeId, destinationId)
-            
-            if (pathNodes.isNullOrEmpty()) {
-                _routeError.emit("Destination Unreachable. Are the stairs connected?")
-                clearRoute()
-            } else {
-                val path = pathNodes.map { Coordinate(it.x, it.y, floor = it.floorLevel, type = it.type) }
-                _activeRoute.value = path
+            val pathNodes = findShortestPath(startNodeId, destinationId)
+            val path = pathNodes?.map { Coordinate(it.x, it.y, floor = it.floorLevel, type = it.type) } ?: emptyList()
+
+            if (path.isEmpty() && destinationNode != null) {
+                val errorMsg = if (_accessibleMode.value) "No accessible path found. Elevator required." else "Destination unreachable."
+                _routeError.tryEmit(errorMsg)
+                clearRoute() 
                 _uiState.update { 
                     it.copy(
-                        selectedDestinationNodeId = destinationId,
-                        activeRoute = path,
-                        statusMessage = "Navigating to ${destinationNode?.name ?: destinationId}"
+                        selectedDestinationNodeId = null,
+                        activeRoute = emptyList(),
+                        statusMessage = "Navigation failed."
                     )
                 }
+                return@launch
+            }
+
+            _activeRoute.value = path
+            _uiState.update { 
+                it.copy(
+                    selectedDestinationNodeId = destinationId,
+                    activeRoute = path,
+                    statusMessage = "Navigating to ${destinationNode?.name ?: destinationId}"
+                )
             }
         }
     }
@@ -1300,28 +1444,7 @@ class MapViewModel(
                 statusMessage = "Position synced to (%.1f, %.1f)".format(x, y)
             ) 
         }
-        if (isSurveyorMode.value) {
-            val lastId = lastDroppedNodeId.value
-            val lastNode = lastId?.let { cachedNodes[it] }
-            val closestSnappable = cachedNodes.values
-                .filter { isSnappableCandidate(it, lastNode) }
-                .minByOrNull { node ->
-                    val dX = node.x - pos.first
-                    val dY = node.y - pos.second
-                    (dX * dX) + (dY * dY)
-                }
-            val snapDist = if (closestSnappable != null) {
-                val dX = closestSnappable.x - pos.first
-                val dY = closestSnappable.y - pos.second
-                kotlin.math.sqrt((dX * dX + dY * dY).toDouble()).toFloat()
-            } else Float.MAX_VALUE
-            
-            if (closestSnappable != null && snapDist <= 3.5f) {
-                snapTargetNodeId.value = closestSnappable.nodeId
-            } else {
-                snapTargetNodeId.value = null
-            }
-        }
+        updateProximitySnapTarget(x, y)
     }
 
     fun toggleSurveyorMode(isActive: Boolean = !_isSurveyorMode.value) {

@@ -74,7 +74,8 @@ fun findNodeAt(
         val nodeScreenY = canvasOffset.y - (node.y * scale)
         val dx = clickOffset.x - nodeScreenX
         val dy = clickOffset.y - nodeScreenY
-        Math.hypot(dx.toDouble(), dy.toDouble()).toFloat() <= hitRadiusPx
+        val distance = Math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
+        distance < 80f || distance <= hitRadiusPx
     }
 }
 
@@ -111,6 +112,7 @@ fun MapCanvas(
     val density = LocalDensity.current
 
     val currentNodes by rememberUpdatedState(activeNodes)
+    val currentEdges by rememberUpdatedState(surveyorEdges)
     val currentIsSurveyorMode by rememberUpdatedState(isSurveyorMode)
     val currentOnNodeLongClick by rememberUpdatedState(onNodeLongClick)
     val currentViewModel by rememberUpdatedState(viewModel)
@@ -155,7 +157,7 @@ fun MapCanvas(
     }
 
     fun findNodeAt(clickOffset: Offset, nodes: List<NodeEntity>): NodeEntity? {
-        val hitRadius = with(density) { 160.dp.toPx() } // Massive touch tolerance for fat-finger selection (+40dp)
+        val hitRadius = maxOf(80f, with(density) { 160.dp.toPx() }) // Massive touch tolerance for fat-finger selection (+40dp)
         val validPortals = listOf("Stairs", "Elevator", "Emergency Exit")
         val nodesToSearch = if (is3DMode) {
             nodes
@@ -174,7 +176,8 @@ fun MapCanvas(
             val pos = project(node.x, node.y, node.floorLevel)
             val dx = clickOffset.x - pos.x
             val dy = clickOffset.y - pos.y
-            Math.hypot(dx.toDouble(), dy.toDouble()).toFloat() <= hitRadius
+            val distance = Math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
+            distance < 80f || distance <= hitRadius
         }
     }
 
@@ -251,41 +254,47 @@ fun MapCanvas(
             .pointerInput(Unit) {
                 detectTapGestures(
                     onTap = { tapOffset ->
-                        // Reverse project tap to map coordinates
-                        val mapX = (tapOffset.x - currentOffset.x) / currentScale
-                        val mapY = -(tapOffset.y - currentOffset.y) / currentScale
-                        
-                        // Expanded hitbox: massive touch tolerance for human fingers (16.0 meters / 160dp screen radius)
-                        val radiusThreshold = 16.0
-                        val hitRadiusPx = with(density) { 160.dp.toPx() }
-                        
-                        val candidateNodes = currentNodes.filter { 
-                            if (is3DMode) true else it.floorLevel == currentFloor 
-                        }
-
-                        val clickedNode = if (is3DMode) {
-                            findNodeAt(tapOffset, candidateNodes)
+                        val candidateNodes = currentNodes.filter { if (is3DMode) true else it.floorLevel == currentFloor }
+                        val tappedNode = if (is3DMode) {
+                            findNodeAt(tapOffset, candidateNodes) // RESTORE NATIVE 3D HIT DETECTION
                         } else {
-                            // Find nearest node with minimum Euclidean distance within enlarged hitbox
+                            val mapX = (tapOffset.x - currentOffset.x) / currentScale
+                            val mapY = -(tapOffset.y - currentOffset.y) / currentScale // RESTORE INVERTED Y
+                            val radiusThreshold = 16.0
+                            val hitRadiusPx = maxOf(80f, with(density) { 160.dp.toPx() })
+
                             candidateNodes.minByOrNull { node ->
                                 Math.hypot((node.x - mapX).toDouble(), (node.y - mapY).toDouble())
                             }?.takeIf { node ->
                                 val dist = Math.hypot((node.x - mapX).toDouble(), (node.y - mapY).toDouble())
-                                val screenDist = dist * currentScale
-                                dist <= radiusThreshold || screenDist <= hitRadiusPx
+                                val screenDist = (dist * currentScale).toFloat()
+                                screenDist < 80f || screenDist <= hitRadiusPx || dist <= radiusThreshold
                             }
                         }
-                            
-                        currentOnNodeSelected?.invoke(clickedNode) // Will pass null if tapped empty space
-                        currentViewModel?.selectNode(clickedNode)
-                        if (currentIsSurveyorMode) {
-                            currentViewModel?.snapTargetNodeId?.value = clickedNode?.nodeId
-                        }
+                        currentOnNodeSelected?.invoke(tappedNode)
+                        currentViewModel?.selectNode(tappedNode)
                     },
                     onLongPress = { clickOffset ->
                         if (currentIsSurveyorMode) {
-                            val clickedNode = findNodeAt(clickOffset, currentNodes)
+                            val candidateNodes = currentNodes.filter { if (is3DMode) true else it.floorLevel == currentFloor }
+                            val clickedNode = if (is3DMode) {
+                                findNodeAt(clickOffset, candidateNodes) // RESTORE NATIVE 3D HIT DETECTION
+                            } else {
+                                val mapX = (clickOffset.x - currentOffset.x) / currentScale
+                                val mapY = -(clickOffset.y - currentOffset.y) / currentScale // RESTORE INVERTED Y
+                                val radiusThreshold = 16.0
+                                val hitRadiusPx = maxOf(80f, with(density) { 160.dp.toPx() })
+
+                                candidateNodes.minByOrNull { node ->
+                                    Math.hypot((node.x - mapX).toDouble(), (node.y - mapY).toDouble())
+                                }?.takeIf { node ->
+                                    val dist = Math.hypot((node.x - mapX).toDouble(), (node.y - mapY).toDouble())
+                                    val screenDist = (dist * currentScale).toFloat()
+                                    screenDist < 80f || screenDist <= hitRadiusPx || dist <= radiusThreshold
+                                }
+                            }
                             if (clickedNode != null) {
+                                currentViewModel?.selectNode(clickedNode)
                                 if (currentOnNodeLongClick != null) {
                                     currentOnNodeLongClick?.invoke(clickedNode)
                                 } else {
@@ -345,7 +354,7 @@ fun MapCanvas(
             }
 
             // 1. Draw Edges connected to this floor
-            surveyorEdges.forEach { edge ->
+            currentEdges.forEach { edge ->
                 if (edge.fromNodeId in nodeIdsOnFloor && edge.toNodeId in nodeIdsOnFloor) {
                     val fromNode = nodesOnFloor.find { it.nodeId == edge.fromNodeId }
                     val toNode = nodesOnFloor.find { it.nodeId == edge.toNodeId }
@@ -356,7 +365,7 @@ fun MapCanvas(
                             color = Color(0xFF708090), // Slate Gray
                             start = startPos,
                             end = endPos,
-                            strokeWidth = 8f
+                            strokeWidth = 6f
                         )
                     }
                 }
@@ -445,14 +454,6 @@ fun MapCanvas(
                         }
                     )
 
-                    if (snapTargetNodeId != null && ghost.nodeId == snapTargetNodeId) {
-                        drawCircle(
-                            color = Color.Yellow,
-                            radius = 24f / scale,
-                            center = pos,
-                            style = Stroke(width = 6f / scale)
-                        )
-                    }
                 }
             }
 
@@ -460,6 +461,16 @@ fun MapCanvas(
             nodesOnFloor.forEach { node ->
                 val pos = project(node.x, node.y, node.floorLevel)
                 val scale = 1f
+
+                val isConnected = currentEdges.any { it.fromNodeId == node.nodeId || it.toNodeId == node.nodeId }
+                if (!isConnected) {
+                    drawCircle(
+                        color = androidx.compose.ui.graphics.Color.Red,
+                        radius = 18f,
+                        center = pos,
+                        style = androidx.compose.ui.graphics.drawscope.Stroke(width = 4f)
+                    )
+                }
 
                 // CRITICAL FIX: Ensure highlight only draws on the correct floor
                 if (currentSelectedNode?.id == node.id && currentSelectedNode?.floorLevel == currentFloor) {
@@ -513,41 +524,57 @@ fun MapCanvas(
                     )
                 }
 
-                if (isSurveyorMode && snapTargetNodeId != null && node.nodeId == snapTargetNodeId) {
-                    drawCircle(
-                        color = Color.Yellow,
-                        radius = 24f,
-                        center = pos,
-                        style = androidx.compose.ui.graphics.drawscope.Stroke(width = 6f)
-                    )
-                }
             }
 
-            // 4. Draw Rubber-Band & Snapping (Surveyor Mode Only)
-            if (isSurveyorMode && floor == currentFloor) {
-                val userCanvasPos = project(currentPosePosition.first, currentPosePosition.second, currentFloor)
-                if (snapTargetNodeId != null) {
-                    val snapNode = activeNodes.find { it.nodeId == snapTargetNodeId }
-                    if (snapNode != null) {
-                        val snapPos = project(snapNode.x, snapNode.y, currentFloor)
+            // 4. Draw Rubber-Band & Smart Snapping (Surveyor Mode Only)
+            if (isSurveyorMode && floor == currentFloor && lastDroppedNodeId != null) {
+                val lastNode = currentNodes.find { it.nodeId == lastDroppedNodeId }
+                if (lastNode != null) {
+                    val startPos = project(lastNode.x, lastNode.y, lastNode.floorLevel)
+
+                    // Priority 1: Manual Selection Override
+                    if (selectedNode != null) {
+                        val targetPos = project(selectedNode.x, selectedNode.y, selectedNode.floorLevel)
                         drawLine(
-                            color = Color.Yellow,
-                            start = userCanvasPos,
-                            end = snapPos,
+                            color = androidx.compose.ui.graphics.Color.Blue,
+                            start = startPos,
+                            end = targetPos,
                             strokeWidth = 6f,
-                            pathEffect = PathEffect.dashPathEffect(floatArrayOf(15f, 15f), 0f)
+                            pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(15f, 15f), 0f)
                         )
-                    }
-                } else if (lastDroppedNodeId != null) {
-                    val lastNode = nodesOnFloor.find { it.nodeId == lastDroppedNodeId }
-                    if (lastNode != null) {
-                        val lastPos = project(lastNode.x, lastNode.y, lastNode.floorLevel)
+                    } 
+                    // Priority 2: Proximity Suggestion
+                    else if (snapTargetNodeId != null) {
+                        val snapNode = currentNodes.find { it.nodeId == snapTargetNodeId }
+                        if (snapNode != null) {
+                            val targetPos = project(snapNode.x, snapNode.y, snapNode.floorLevel)
+                            val isSameFloor = snapNode.floorLevel == currentFloor
+                            val snapColor = if (isSameFloor) androidx.compose.ui.graphics.Color.Yellow else androidx.compose.ui.graphics.Color.Magenta
+
+                            // Draw the Suggestion Ring
+                            drawCircle(
+                                color = snapColor,
+                                radius = 24f,
+                                center = targetPos,
+                                style = androidx.compose.ui.graphics.drawscope.Stroke(width = 6f)
+                            )
+                            // Draw the dashed rubber band
+                            drawLine(
+                                color = snapColor,
+                                start = startPos,
+                                end = targetPos,
+                                strokeWidth = 6f,
+                                pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(15f, 15f), 0f)
+                            )
+                        }
+                    } else {
+                        val userCanvasPos = project(currentPosePosition.first, currentPosePosition.second, currentFloor)
                         drawLine(
-                            color = Color.Yellow,
-                            start = lastPos,
+                            color = androidx.compose.ui.graphics.Color.Yellow,
+                            start = startPos,
                             end = userCanvasPos,
                             strokeWidth = 4f,
-                            pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f)
+                            pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f)
                         )
                     }
                 }
