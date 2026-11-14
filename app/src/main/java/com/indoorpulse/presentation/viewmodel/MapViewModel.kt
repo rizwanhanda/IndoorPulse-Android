@@ -118,6 +118,7 @@ class MapViewModel(
     fun resumePathFromNode(node: NodeEntity) {
         lastDroppedNodeId.value = node.nodeId
         snapTargetNodeId.value = null
+        _selectedNode.value = node
         _uiState.update { it.copy(statusMessage = "Resumed path from ${node.label}") }
     }
 
@@ -883,6 +884,8 @@ class MapViewModel(
             refreshCache(_activeBuildingId.value ?: "default_building")
             setFloor(targetFloorLevel)
             _selectedNode.value = newNode
+            droppedNodesChain.add(newNodeId)
+            lastDroppedNodeId.value = newNodeId
             _uiState.update { it.copy(statusMessage = "Extruded portal to floor L$targetFloorLevel") }
         }
     }
@@ -922,7 +925,7 @@ class MapViewModel(
         viewModelScope.launch {
             try {
                 val lastId = lastDroppedNodeId.value
-                val targetId = snapTargetNodeId.value
+                val targetId = _selectedNode.value?.nodeId ?: snapTargetNodeId.value
                 
                 if (lastId != null && targetId != null && lastId != targetId) {
                     val lastNode = cachedNodes[lastId]
@@ -952,6 +955,7 @@ class MapViewModel(
                             
                             droppedNodesChain.add(targetId)
                             lastDroppedNodeId.value = targetId
+                            _selectedNode.value = null
                             _undoStack.value = _undoStack.value + SurveyorAction.SnapEdge(verticalEdge)
                             _redoStack.value = emptyList()
                             refreshCache()
@@ -966,6 +970,7 @@ class MapViewModel(
                             
                             droppedNodesChain.add(targetId)
                             lastDroppedNodeId.value = targetId
+                            _selectedNode.value = null
                             _undoStack.value = _undoStack.value + SurveyorAction.SnapEdge(newEdge)
                             _redoStack.value = emptyList()
                             refreshCache()
@@ -1164,7 +1169,9 @@ class MapViewModel(
             return
         }
         val ignoreId = lastDroppedNodeId.value
-        val candidates = cachedNodes.values.filter { it.nodeId != ignoreId }
+        val candidates = cachedNodes.values.filter { 
+            it.nodeId != ignoreId && it.floorLevel == _currentFloor.value 
+        }
         val closestNode = candidates.minByOrNull { node ->
             Math.hypot((node.x - posX).toDouble(), (node.y - posY).toDouble())
         }

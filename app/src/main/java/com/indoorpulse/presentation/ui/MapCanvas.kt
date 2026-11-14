@@ -44,6 +44,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.StrokeCap
 import com.indoorpulse.domain.model.Coordinate
 import com.indoorpulse.domain.model.floorLevel
+import kotlin.math.hypot
 
 private fun getProjectedPoint(px: Float, py: Float, x1: Float, y1: Float, x2: Float, y2: Float): Pair<Float, Float> {
     val l2 = (x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2)
@@ -156,28 +157,49 @@ fun MapCanvas(
         }
     }
 
-    fun findNodeAt(clickOffset: Offset, nodes: List<NodeEntity>): NodeEntity? {
-        val hitRadius = maxOf(80f, with(density) { 160.dp.toPx() }) // Massive touch tolerance for fat-finger selection (+40dp)
-        val validPortals = listOf("Stairs", "Elevator", "Emergency Exit")
-        val nodesToSearch = if (is3DMode) {
-            nodes
+    fun findNodeAt(tapOffset: Offset, candidateNodes: List<NodeEntity>): NodeEntity? {
+        if (is3DMode) {
+            val localTapX = (tapOffset.x - currentOffset.x) / currentScale
+            val localTapY = (tapOffset.y - currentOffset.y) / currentScale
+            val threshold = 80f / currentScale
+
+            return candidateNodes
+                .map { node ->
+                    val rawPos = project(node.x, node.y, node.floorLevel)
+                    val pos = Offset(
+                        (rawPos.x - currentOffset.x) / currentScale,
+                        (rawPos.y - currentOffset.y) / currentScale
+                    )
+                    val dist = hypot(localTapX - pos.x, localTapY - pos.y)
+                    Triple(node, dist, node.floorLevel == currentFloor)
+                }
+                .filter { (_, dist, _) -> dist <= threshold }
+                .minWithOrNull(
+                    compareBy<Triple<NodeEntity, Float, Boolean>> { (_, dist, _) -> dist }
+                        .thenByDescending { (_, _, isCurrentFloor) -> isCurrentFloor }
+                )
+                ?.first
         } else {
-            nodes.filter { 
+            val validPortals = listOf("Stairs", "Elevator", "Emergency Exit")
+            val nodesToSearch = candidateNodes.filter { 
                 it.floorLevel == currentFloor || 
                 (currentIsSurveyorMode && currentFloor > 0 && it.floorLevel == currentFloor - 1 && it.type in validPortals)
             }
-        }
-        return nodesToSearch.minByOrNull { node ->
-            val pos = project(node.x, node.y, node.floorLevel)
-            val dx = clickOffset.x - pos.x
-            val dy = clickOffset.y - pos.y
-            dx * dx + dy * dy
-        }?.takeIf { node ->
-            val pos = project(node.x, node.y, node.floorLevel)
-            val dx = clickOffset.x - pos.x
-            val dy = clickOffset.y - pos.y
-            val distance = Math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
-            distance < 80f || distance <= hitRadius
+            val hitRadius = maxOf(80f, with(density) { 160.dp.toPx() })
+            return nodesToSearch
+                .map { node ->
+                    val pos = project(node.x, node.y, node.floorLevel)
+                    val dx = tapOffset.x - pos.x
+                    val dy = tapOffset.y - pos.y
+                    val dist = hypot(dx.toDouble(), dy.toDouble()).toFloat()
+                    Triple(node, dist, node.floorLevel == currentFloor)
+                }
+                .filter { (_, dist, _) -> dist < 80f || dist <= hitRadius }
+                .minWithOrNull(
+                    compareBy<Triple<NodeEntity, Float, Boolean>> { (_, dist, _) -> dist }
+                        .thenByDescending { (_, _, isCurrentFloor) -> isCurrentFloor }
+                )
+                ?.first
         }
     }
 
@@ -255,44 +277,14 @@ fun MapCanvas(
                 detectTapGestures(
                     onTap = { tapOffset ->
                         val candidateNodes = currentNodes.filter { if (is3DMode) true else it.floorLevel == currentFloor }
-                        val tappedNode = if (is3DMode) {
-                            findNodeAt(tapOffset, candidateNodes) // RESTORE NATIVE 3D HIT DETECTION
-                        } else {
-                            val mapX = (tapOffset.x - currentOffset.x) / currentScale
-                            val mapY = -(tapOffset.y - currentOffset.y) / currentScale // RESTORE INVERTED Y
-                            val radiusThreshold = 16.0
-                            val hitRadiusPx = maxOf(80f, with(density) { 160.dp.toPx() })
-
-                            candidateNodes.minByOrNull { node ->
-                                Math.hypot((node.x - mapX).toDouble(), (node.y - mapY).toDouble())
-                            }?.takeIf { node ->
-                                val dist = Math.hypot((node.x - mapX).toDouble(), (node.y - mapY).toDouble())
-                                val screenDist = (dist * currentScale).toFloat()
-                                screenDist < 80f || screenDist <= hitRadiusPx || dist <= radiusThreshold
-                            }
-                        }
+                        val tappedNode = findNodeAt(tapOffset, candidateNodes)
                         currentOnNodeSelected?.invoke(tappedNode)
                         currentViewModel?.selectNode(tappedNode)
                     },
                     onLongPress = { clickOffset ->
                         if (currentIsSurveyorMode) {
                             val candidateNodes = currentNodes.filter { if (is3DMode) true else it.floorLevel == currentFloor }
-                            val clickedNode = if (is3DMode) {
-                                findNodeAt(clickOffset, candidateNodes) // RESTORE NATIVE 3D HIT DETECTION
-                            } else {
-                                val mapX = (clickOffset.x - currentOffset.x) / currentScale
-                                val mapY = -(clickOffset.y - currentOffset.y) / currentScale // RESTORE INVERTED Y
-                                val radiusThreshold = 16.0
-                                val hitRadiusPx = maxOf(80f, with(density) { 160.dp.toPx() })
-
-                                candidateNodes.minByOrNull { node ->
-                                    Math.hypot((node.x - mapX).toDouble(), (node.y - mapY).toDouble())
-                                }?.takeIf { node ->
-                                    val dist = Math.hypot((node.x - mapX).toDouble(), (node.y - mapY).toDouble())
-                                    val screenDist = (dist * currentScale).toFloat()
-                                    screenDist < 80f || screenDist <= hitRadiusPx || dist <= radiusThreshold
-                                }
-                            }
+                            val clickedNode = findNodeAt(clickOffset, candidateNodes)
                             if (clickedNode != null) {
                                 currentViewModel?.selectNode(clickedNode)
                                 if (currentOnNodeLongClick != null) {
